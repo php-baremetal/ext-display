@@ -1,0 +1,351 @@
+<?php
+// php-baremetal/ext-display 1.0.0 — IDE helper, not loaded at runtime.
+
+namespace Baremetal\Output {
+    /**
+     * A display surface with a framebuffer, implemented by the panel driver classes.
+     *
+     * Coordinates are pixels from the top-left corner; rectangles are x, y, w, h; regions are [x0, x1) x [y0, y1);
+     * colors are RGB565 integers (the low 16 bits are used). Every drawing method clips to the screen without
+     * errors, and a width or height of 0 or less draws nothing. Any method of an object without a surface (its
+     * driver did not attach one, or the object is a clone) throws \Error "<Panel> is not initialised".
+     */
+    interface Display
+    {
+        /**
+         * The panel's width.
+         *
+         * @return int The width in pixels.
+         */
+        public function width(): int;
+
+        /**
+         * The panel's height.
+         *
+         * @return int The height in pixels.
+         */
+        public function height(): int;
+
+        /**
+         * A color in the panel's format from 0..255 channels (values outside are clamped); rgb(255, 0, 0) is 0xF800.
+         *
+         * @param int $r Red, 0 to 255.
+         * @param int $g Green, 0 to 255.
+         * @param int $b Blue, 0 to 255.
+         * @return int The color.
+         */
+        public function rgb(int $r, int $g, int $b): int;
+
+        /**
+         * Fills the framebuffer with one color.
+         *
+         * @param int $color The color, RGB565.
+         * @return void
+         * @throws \RuntimeException "<Panel>: push failed (error 0x..)" when an earlier asynchronous flush failed,
+         *                           or "<Panel>: flush timed out" after waiting over 2000 ms for rows in flight.
+         */
+        public function clear(int $color): void;
+
+        /**
+         * Draws one pixel.
+         *
+         * @param int $x Column in pixels.
+         * @param int $y Row in pixels.
+         * @param int $color The color, RGB565.
+         * @return void
+         * @throws \RuntimeException "<Panel>: push failed (error 0x..)" when an earlier asynchronous flush failed,
+         *                           or "<Panel>: flush timed out" after waiting over 2000 ms for rows in flight.
+         */
+        public function pixel(int $x, int $y, int $color): void;
+
+        /**
+         * Draws a line, both ends included.
+         *
+         * @param int $x0 Column of the first end, in pixels.
+         * @param int $y0 Row of the first end, in pixels.
+         * @param int $x1 Column of the second end, in pixels.
+         * @param int $y1 Row of the second end, in pixels.
+         * @param int $color The color, RGB565.
+         * @return void
+         * @throws \RuntimeException "<Panel>: push failed (error 0x..)" when an earlier asynchronous flush failed,
+         *                           or "<Panel>: flush timed out" after waiting over 2000 ms for rows in flight.
+         */
+        public function line(int $x0, int $y0, int $x1, int $y1, int $color): void;
+
+        /**
+         * Draws the outline of a rectangle; a width or height of 1 is a line.
+         *
+         * @param int $x Left column in pixels.
+         * @param int $y Top row in pixels.
+         * @param int $w Width in pixels.
+         * @param int $h Height in pixels.
+         * @param int $color The color, RGB565.
+         * @return void
+         * @throws \RuntimeException "<Panel>: push failed (error 0x..)" when an earlier asynchronous flush failed,
+         *                           or "<Panel>: flush timed out" after waiting over 2000 ms for rows in flight.
+         */
+        public function rect(int $x, int $y, int $w, int $h, int $color): void;
+
+        /**
+         * Draws a filled rectangle.
+         *
+         * @param int $x Left column in pixels.
+         * @param int $y Top row in pixels.
+         * @param int $w Width in pixels.
+         * @param int $h Height in pixels.
+         * @param int $color The color, RGB565.
+         * @return void
+         * @throws \RuntimeException "<Panel>: push failed (error 0x..)" when an earlier asynchronous flush failed,
+         *                           or "<Panel>: flush timed out" after waiting over 2000 ms for rows in flight.
+         */
+        public function fillRect(int $x, int $y, int $w, int $h, int $color): void;
+
+        /**
+         * Draws the outline of a circle; a radius of 0 is one pixel.
+         *
+         * @param int $cx Column of the center, in pixels.
+         * @param int $cy Row of the center, in pixels.
+         * @param int $r Radius in pixels.
+         * @param int $color The color, RGB565.
+         * @return void
+         * @throws \RuntimeException "<Panel>: push failed (error 0x..)" when an earlier asynchronous flush failed,
+         *                           or "<Panel>: flush timed out" after waiting over 2000 ms for rows in flight.
+         */
+        public function circle(int $cx, int $cy, int $r, int $color): void;
+
+        /**
+         * Draws a filled circle.
+         *
+         * @param int $cx Column of the center, in pixels.
+         * @param int $cy Row of the center, in pixels.
+         * @param int $r Radius in pixels.
+         * @param int $color The color, RGB565.
+         * @return void
+         * @throws \RuntimeException "<Panel>: push failed (error 0x..)" when an earlier asynchronous flush failed,
+         *                           or "<Panel>: flush timed out" after waiting over 2000 ms for rows in flight.
+         */
+        public function fillCircle(int $cx, int $cy, int $r, int $color): void;
+
+        /**
+         * Draws UTF-8 text with $y the top of the line.
+         *
+         * @param int $x Left column in pixels.
+         * @param int $y Top row of the line, in pixels.
+         * @param string $s The text, UTF-8.
+         * @param int $color The text color, RGB565.
+         * @param int|null $bg The background of each character cell, which anti-aliased glyphs blend against;
+         *                     null leaves the background untouched.
+         * @param \Baremetal\Display\Font|null $font The font; null is the default font.
+         * @return int The width drawn, in pixels.
+         * @throws \RuntimeException When no font is given and the firmware has no default font.
+         * @throws \RuntimeException "<Panel>: push failed (error 0x..)" when an earlier asynchronous flush failed,
+         *                           or "<Panel>: flush timed out" after waiting over 2000 ms for rows in flight.
+         */
+        public function text(int $x, int $y, string $s, int $color, ?int $bg = null, ?\Baremetal\Display\Font $font = null): int;
+
+        /**
+         * The width text() would draw.
+         *
+         * @param string $s The text, UTF-8.
+         * @param \Baremetal\Display\Font|null $font The font; null is the default font.
+         * @return int The width in pixels.
+         * @throws \RuntimeException When no font is given and the firmware has no default font.
+         */
+        public function textWidth(string $s, ?\Baremetal\Display\Font $font = null): int;
+
+        /**
+         * Draws w * h pixels in the panel's format, rows top to bottom, two bytes per pixel with the high byte first.
+         *
+         * @param int $x Left column in pixels.
+         * @param int $y Top row in pixels.
+         * @param int $w Width in pixels, 0 to 65536.
+         * @param int $h Height in pixels, 0 to 65536.
+         * @param string $pixels Exactly w * h * 2 bytes.
+         * @return void
+         * @throws \ValueError When $w or $h is out of range or $pixels has the wrong length.
+         * @throws \RuntimeException "<Panel>: push failed (error 0x..)" when an earlier asynchronous flush failed,
+         *                           or "<Panel>: flush timed out" after waiting over 2000 ms for rows in flight.
+         */
+        public function image(int $x, int $y, int $w, int $h, string $pixels): void;
+
+        /**
+         * Sends the framebuffer to the panel: without arguments the rectangle touched since the last flush,
+         * otherwise the region given, clipped.
+         *
+         * With an asynchronous driver it starts the region and returns; a region given while another is in
+         * flight is pending (at most one, later flushes merge into it).
+         *
+         * @param int|null $x0 Left column of the region, in pixels (all four coordinates or none).
+         * @param int|null $y0 Top row of the region, in pixels.
+         * @param int|null $x1 Column after the right edge, in pixels.
+         * @param int|null $y1 Row after the bottom edge, in pixels.
+         * @return void
+         * @throws \ArgumentCountError When one to three coordinates are given.
+         * @throws \RuntimeException When a push fails or the wait for the flush exceeds 2000 ms.
+         */
+        public function flush(?int $x0 = null, ?int $y0 = null, ?int $x1 = null, ?int $y1 = null): void;
+
+        /**
+         * Returns when no flush is in flight or pending.
+         *
+         * @return void
+         * @throws \RuntimeException The error of a flush that failed, or when the wait exceeds 2000 ms.
+         */
+        public function flushWait(): void;
+
+        /**
+         * Sets the backlight after waiting for the flushes; does nothing on a panel without a backlight.
+         *
+         * @param int $level 0 (off) to 255.
+         * @return void
+         * @throws \ValueError When $level is outside 0 to 255.
+         * @throws \RuntimeException When the driver fails to set it, an earlier flush failed ("<Panel>: push failed
+         *                           (error 0x..)"), or the wait for the flush exceeds 2000 ms ("<Panel>: flush timed out").
+         */
+        public function backlight(int $level): void;
+
+        /**
+         * Puts the panel in its sleep mode; does nothing on a panel without one.
+         *
+         * @return void
+         * @throws \RuntimeException When the driver fails, an earlier flush failed ("<Panel>: push failed
+         *                           (error 0x..)"), or the wait for the flush exceeds 2000 ms ("<Panel>: flush timed out").
+         */
+        public function sleep(): void;
+
+        /**
+         * Wakes the panel from its sleep mode; does nothing on a panel without one.
+         *
+         * @return void
+         * @throws \RuntimeException When the driver fails, an earlier flush failed ("<Panel>: push failed
+         *                           (error 0x..)"), or the wait for the flush exceeds 2000 ms ("<Panel>: flush timed out").
+         */
+        public function wake(): void;
+
+        /**
+         * The panel's nominal refresh rate, from the datasheet or the configuration, not a measurement.
+         *
+         * @return float The rate in Hz, or 0.0 when the driver does not say.
+         */
+        public function refreshRate(): float;
+
+        /**
+         * Raises an event at the end of every region sent; a subclass of Baremetal\Display\Flushed gets the
+         * region and the transfer time.
+         *
+         * One class per display: a second call replaces the first.
+         *
+         * @param string $event The event class, which must extend Baremetal\Event.
+         * @return \Baremetal\Source The handle, a Baremetal\Display\FlushSource.
+         * @throws \Error When the class is unknown or the event source table is full.
+         */
+        public function onFlushed(string $event): \Baremetal\Source;
+
+        /**
+         * Raises an event at every pulse of the panel's TE pin, coalescing; a subclass of Baremetal\TimerEvent
+         * gets $ticks.
+         *
+         * One class per display: a second call replaces the first.
+         *
+         * @param string $event The event class, which must extend Baremetal\Event.
+         * @return \Baremetal\Source The handle, a Baremetal\Display\VsyncSource.
+         * @throws \ValueError When the display has no TE pin.
+         * @throws \Error When the class is unknown or the event source table is full.
+         */
+        public function onVsync(string $event): \Baremetal\Source;
+    }
+}
+
+namespace Baremetal\Display {
+    /**
+     * A bitmap font of the firmware; get one with Font::get().
+     *
+     * new Font() and clone of a font throw \Error.
+     */
+    final class Font
+    {
+        private function __construct() {}
+
+        /**
+         * A font of the firmware by name.
+         *
+         * @param string $name The font name, e.g. 'default' or 'title'.
+         * @return Font The font.
+         * @throws \RuntimeException When the font is unknown or has an unsupported bits per pixel.
+         */
+        public static function get(string $name): Font {}
+
+        /**
+         * The names of every font in the firmware.
+         *
+         * @return array The names, in name order.
+         */
+        public static function names(): array {}
+
+        /**
+         * The font's name.
+         *
+         * @return string The name.
+         */
+        public function name(): string {}
+
+        /**
+         * The line advance.
+         *
+         * @return int The height in pixels.
+         */
+        public function height(): int {}
+
+        /**
+         * The distance from the top of the line to the baseline.
+         *
+         * @return int The ascent in pixels.
+         */
+        public function ascent(): int {}
+    }
+
+    /**
+     * The event of onFlushed(): a subclass gets the region sent and the transfer time; $device is the display.
+     */
+    class Flushed extends \Baremetal\Event
+    {
+        /**
+         * Left column of the region, in pixels.
+         */
+        public readonly int $x0;
+
+        /**
+         * Top row of the region, in pixels.
+         */
+        public readonly int $y0;
+
+        /**
+         * Column after the right edge of the region, in pixels.
+         */
+        public readonly int $x1;
+
+        /**
+         * Row after the bottom edge of the region, in pixels.
+         */
+        public readonly int $y1;
+
+        /**
+         * The transfer time in microseconds.
+         */
+        public readonly int $us;
+    }
+
+    /**
+     * The handle of the onFlushed() source; the source belongs to the display.
+     */
+    final class FlushSource extends \Baremetal\Source
+    {
+    }
+
+    /**
+     * The handle of the onVsync() source; stop() keeps the TE interrupt, which vsync may need.
+     */
+    final class VsyncSource extends \Baremetal\Source
+    {
+    }
+}

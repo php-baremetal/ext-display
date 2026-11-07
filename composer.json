@@ -6,5 +6,5 @@
     "authors": [{ "name": "Gianfrancesco Aurecchia", "email": "gianfri@php-baremetal.com" }],
     "require": { "php": ">=8.3", "php-baremetal/bm-common": "^1.1", "php-baremetal/ext-events": "^1.1", "php-baremetal/events-hal": "^1.4" },
     "conflict": { "php-baremetal/ext-spi": "<1.1.0" },
-    "extra": { "baremetal": { "module": "display", "priority": 90, "fonts": { "default": "fonts/default.h" } } }
+    "extra": { "baremetal": { "module": "display", "priority": 90, "fonts": { "default": "fonts/default.h" }, "ide-stubs": ["ide/ext-display.stub"] } }
 }

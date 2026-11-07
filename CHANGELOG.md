@@ -3,6 +3,7 @@
 ## 1.0.0
 
 - First release.
+- Added: ide/ext-display.stub, the PHP declarations of the package for IDEs (conductor copies it into vendor/php-baremetal/ide-stubs/).
 - Asynchronous flush: with a driver that has `begin`/`wait`, `flush()` starts the region and returns; a drawing
   waits only for the rows not yet sent that it touches; a `flush()` during another one is pending (one region,
   merged). A failed transfer throws `<Panel>: push failed (error 0x..)` at the next call; a wait longer than
