@@ -268,99 +268,12 @@ const uint8_t *display_fb_direct(const display_fb_t *fb, int x0, int y0, int x1)
     return NULL;
 }
 
-uint32_t display_fb_utf8(const char **p, const char *end)
-{
-    const unsigned char *s = (const unsigned char *)*p;
-    size_t left = (size_t)(end - *p);
-    unsigned char b = s[0];
-    uint32_t cp;
-    size_t n;
-    if (b < 0x80) {
-        *p += 1;
-        return b;
-    }
-    if (b >= 0xC2 && b <= 0xDF) {
-        n = 2; cp = b & 0x1F;
-    } else if (b >= 0xE0 && b <= 0xEF) {
-        n = 3; cp = b & 0x0F;
-    } else if (b >= 0xF0 && b <= 0xF4) {
-        n = 4; cp = b & 0x07;
-    } else {
-        *p += 1;
-        return 0xFFFD;
-    }
-    if (left < n) {
-        *p += 1;
-        return 0xFFFD;
-    }
-    for (size_t i = 1; i < n; i++) {
-        if ((s[i] & 0xC0) != 0x80) {
-            *p += 1;
-            return 0xFFFD;
-        }
-        cp = (cp << 6) | (s[i] & 0x3F);
-    }
-    if ((n == 3 && cp < 0x800) || (n == 4 && (cp < 0x10000 || cp > 0x10FFFF)) || (cp >= 0xD800 && cp <= 0xDFFF)) {
-        *p += 1;
-        return 0xFFFD;
-    }
-    *p += n;
-    return cp;
-}
-
-void display_fb_font_gfx(display_fb_font_t *f, const GFXfont *gfx)
-{
-    int top = 0;
-    for (unsigned i = 0; gfx->last >= gfx->first && i <= (unsigned)(gfx->last - gfx->first); i++) {
-        if (gfx->glyph[i].yOffset < top) {
-            top = gfx->glyph[i].yOffset;
-        }
-    }
-    *f = (display_fb_font_t){
-        .bitmap = gfx->bitmap, .glyph = gfx->glyph, .ranges = NULL, .range_count = 0,
-        .gfx_first = gfx->first, .gfx_last = gfx->last,
-        .bpp = 1, .line_height = gfx->yAdvance, .ascent = (uint8_t)-top,
-    };
-}
-
-bool display_fb_font_ext(display_fb_font_t *f, const display_font_t *ext)
-{
-    if (ext->bpp != 1 && ext->bpp != 2 && ext->bpp != 4) {
-        return false;
-    }
-    *f = (display_fb_font_t){
-        .bitmap = ext->bitmap, .glyph = ext->glyph, .ranges = ext->ranges, .range_count = ext->range_count,
-        .gfx_first = 1, .gfx_last = 0,
-        .bpp = ext->bpp, .line_height = ext->line_height, .ascent = ext->ascent,
-    };
-    return true;
-}
-
-const GFXglyph *display_fb_glyph(const display_fb_font_t *f, uint32_t cp)
-{
-    if (!f->ranges) {
-        return cp >= f->gfx_first && cp <= f->gfx_last ? &f->glyph[cp - f->gfx_first] : NULL;
-    }
-    for (uint16_t i = 0; i < f->range_count; i++) {
-        const display_font_range_t *r = &f->ranges[i];
-        if (cp >= r->first && cp <= r->last) {
-            return &f->glyph[r->glyph + (cp - r->first)];
-        }
-    }
-    return NULL;
-}
-
 static uint16_t blend(uint16_t fg, uint16_t bg, unsigned v, unsigned max)
 {
     unsigned r = (((fg >> 11) & 0x1F) * v + ((bg >> 11) & 0x1F) * (max - v) + max / 2) / max;
     unsigned g = (((fg >> 5) & 0x3F) * v + ((bg >> 5) & 0x3F) * (max - v) + max / 2) / max;
     unsigned b = ((fg & 0x1F) * v + (bg & 0x1F) * (max - v) + max / 2) / max;
     return (uint16_t)((r << 11) | (g << 5) | b);
-}
-
-static int missing_width(const display_fb_font_t *f)
-{
-    return f->line_height / 2;
 }
 
 static void draw_glyph(display_fb_t *fb, int cx, int base, const display_fb_font_t *f, const GFXglyph *g,
@@ -394,7 +307,7 @@ int display_fb_text(display_fb_t *fb, int x, int y, const char *s, size_t len, u
     int base = y + f->ascent;
     while (p < end) {
         const GFXglyph *g = display_fb_glyph(f, display_fb_utf8(&p, end));
-        int adv = g ? g->xAdvance : missing_width(f);
+        int adv = display_text_advance(f, g);
         if (cx >= fb->w) {   /* past the right edge: only the width is left to count */
             cx += adv;
             continue;
@@ -418,7 +331,7 @@ int display_fb_text_width(const char *s, size_t len, const display_fb_font_t *f)
     int64_t w = 0;
     while (p < end) {
         const GFXglyph *g = display_fb_glyph(f, display_fb_utf8(&p, end));
-        w += g ? g->xAdvance : missing_width(f);
+        w += display_text_advance(f, g);
     }
     return w > INT_MAX ? INT_MAX : (int)w;
 }

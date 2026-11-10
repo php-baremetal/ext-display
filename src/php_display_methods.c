@@ -72,6 +72,13 @@ static bool surface_check(display_surface_t *s)
         RETURN_THROWS();                                         \
     }
 
+/* THIS_SURFACE for the methods that draw or send: refused while a renderer holds the panel. */
+#define THIS_DRAW(s)                                             \
+    display_surface_t *s = display_surface(Z_OBJ_P(ZEND_THIS)); \
+    if (!s || !display_not_claimed(s) || !surface_check(s)) {    \
+        RETURN_THROWS();                                         \
+    }
+
 /* Whether the rectangle *arg is clear of the rows not yet sent and of the pending region. */
 static bool no_conflict(display_surface_t *s, const void *arg)
 {
@@ -268,7 +275,7 @@ PHP_METHOD(Display, clear)
     ZEND_PARSE_PARAMETERS_START(1, 1)
         Z_PARAM_LONG(c)
     ZEND_PARSE_PARAMETERS_END();
-    THIS_SURFACE(s);
+    THIS_DRAW(s);
     GUARD(s, 0, 0, s->fb.w, s->fb.h);
     display_fb_clear(&s->fb, color(c));
 }
@@ -281,7 +288,7 @@ PHP_METHOD(Display, pixel)
         Z_PARAM_LONG(y)
         Z_PARAM_LONG(c)
     ZEND_PARSE_PARAMETERS_END();
-    THIS_SURFACE(s);
+    THIS_DRAW(s);
     GUARD(s, coord(x), coord(y), coord(x) + 1, coord(y) + 1);
     display_fb_pixel(&s->fb, coord(x), coord(y), color(c));
 }
@@ -296,7 +303,7 @@ PHP_METHOD(Display, line)
         Z_PARAM_LONG(y1)
         Z_PARAM_LONG(c)
     ZEND_PARSE_PARAMETERS_END();
-    THIS_SURFACE(s);
+    THIS_DRAW(s);
     int ax = coord(x0), ay = coord(y0), bx = coord(x1), by = coord(y1);
     GUARD(s, ax < bx ? ax : bx, ay < by ? ay : by, (ax > bx ? ax : bx) + 1, (ay > by ? ay : by) + 1);
     display_fb_line(&s->fb, ax, ay, bx, by, color(c));
@@ -312,7 +319,7 @@ static void rect_args(INTERNAL_FUNCTION_PARAMETERS, bool fill)
         Z_PARAM_LONG(h)
         Z_PARAM_LONG(c)
     ZEND_PARSE_PARAMETERS_END();
-    THIS_SURFACE(s);
+    THIS_DRAW(s);
     GUARD(s, coord(x), coord(y), coord(x) + coord(w), coord(y) + coord(h));
     (fill ? display_fb_fill_rect : display_fb_rect)(&s->fb, coord(x), coord(y), coord(w), coord(h), color(c));
 }
@@ -336,7 +343,7 @@ static void circle_args(INTERNAL_FUNCTION_PARAMETERS, bool fill)
         Z_PARAM_LONG(r)
         Z_PARAM_LONG(c)
     ZEND_PARSE_PARAMETERS_END();
-    THIS_SURFACE(s);
+    THIS_DRAW(s);
     GUARD(s, coord(cx) - coord(r), coord(cy) - coord(r), coord(cx) + coord(r) + 1, coord(cy) + coord(r) + 1);
     (fill ? display_fb_fill_circle : display_fb_circle)(&s->fb, coord(cx), coord(cy), coord(r), color(c));
 }
@@ -366,7 +373,7 @@ PHP_METHOD(Display, text)
         Z_PARAM_LONG_OR_NULL(bg, bg_null)
         Z_PARAM_OBJ_OF_CLASS_OR_NULL(font, display_font_ce)
     ZEND_PARSE_PARAMETERS_END();
-    THIS_SURFACE(s);
+    THIS_DRAW(s);
     const display_fb_font_t *f = display_font_of(font);
     if (!f) {
         RETURN_THROWS();
@@ -406,7 +413,7 @@ PHP_METHOD(Display, image)
         Z_PARAM_LONG(h)
         Z_PARAM_STR(pixels)
     ZEND_PARSE_PARAMETERS_END();
-    THIS_SURFACE(s);
+    THIS_DRAW(s);
     if (w < 0 || w > DISPLAY_COORD_MAX) {
         zend_argument_value_error(3, "must be between 0 and %d", DISPLAY_COORD_MAX);
         RETURN_THROWS();
@@ -470,7 +477,7 @@ PHP_METHOD(Display, flush)
             ZSTR_VAL(Z_OBJCE_P(ZEND_THIS)->name), given);
         RETURN_THROWS();
     }
-    THIS_SURFACE(s);
+    THIS_DRAW(s);
     display_fb_rect_t r;
     if (given == 0) {
         if (!display_fb_take_dirty(&s->fb, &r)) {
@@ -496,7 +503,7 @@ PHP_METHOD(Display, flush)
 PHP_METHOD(Display, flushWait)
 {
     ZEND_PARSE_PARAMETERS_NONE();
-    THIS_SURFACE(s);
+    THIS_DRAW(s);
     if (!display_wait_idle(s) || !surface_check(s)) {   /* a failure of what it waited for throws here */
         RETURN_THROWS();
     }
@@ -538,7 +545,13 @@ static void sleep_to(INTERNAL_FUNCTION_PARAMETERS, bool on)
         RETURN_THROWS();
     }
     if (s->ops->sleep) {
+        if (on) {
+            display_notify(s, DISPLAY_PANEL_SLEEP);   /* a renderer pauses its frames before the panel goes off */
+        }
         bm_err_t e = s->ops->sleep(s->panel, on);
+        if (e == BM_OK ? !on : on) {
+            display_notify(s, DISPLAY_PANEL_WAKE);    /* awake again, or a sleep that failed: frames may go */
+        }
         if (e != BM_OK) {
             op_failed(on ? "sleep" : "wake", e);
         }

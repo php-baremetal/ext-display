@@ -18,6 +18,7 @@
  */
 #include "php_display.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -265,17 +266,90 @@ void display_invalidate(void *panel)
     ZEND_HASH_FOREACH_PTR(&s_surfaces, s) {
         if (s->panel == panel) {
             display_fb_mark(&s->fb, 0, 0, s->fb.w, s->fb.h);
+            display_notify(s, DISPLAY_PANEL_LOST);   /* a renderer holds the panel: it sends the whole frame */
         }
     } ZEND_HASH_FOREACH_END();
 }
 
+void display_notify(display_surface_t *s, display_panel_event_t event)
+{
+    if (s->owner[0] && s->notify) {
+        s->notify(s->notify_arg, event);
+    }
+}
+
 display_surface_t *display_surface(zend_object *obj)
 {
-    display_surface_t *s = zend_hash_index_find_ptr(&s_surfaces, zend_object_to_weakref_key(obj));
+    display_surface_t *s = display_surface_find(obj);
     if (!s) {
         zend_throw_error(NULL, "%s is not initialised", display_panel_name(obj));
     }
     return s;
+}
+
+display_surface_t *display_surface_find(zend_object *obj)
+{
+    return obj ? zend_hash_index_find_ptr(&s_surfaces, zend_object_to_weakref_key(obj)) : NULL;
+}
+
+void display_panel_of(zend_object *obj, const display_panel_ops_t **ops, void **panel)
+{
+    display_surface_t *s = display_surface_find(obj);
+    *ops = s ? s->ops : NULL;
+    *panel = s ? s->panel : NULL;
+}
+
+bool display_claim(zend_object *obj, const char *owner)
+{
+    return display_claim_ex(obj, owner, NULL, NULL);
+}
+
+bool display_claim_ex(zend_object *obj, const char *owner, void (*notify)(void *arg, display_panel_event_t event),
+                      void *arg)
+{
+    display_surface_t *s = owner && *owner ? display_surface_find(obj) : NULL;
+    if (!s || s->owner[0]) {
+        return false;
+    }
+    /* The flush in flight ends first (a vsync region still waiting for its TE pulse is dropped: it would draw over
+       the renderer). Nothing is claimed when the driver does not finish. */
+    if (!quiesce(s)) {
+        display_fb_mark(&s->fb, 0, 0, s->fb.w, s->fb.h);   /* a dropped vsync region is sent again by the next flush() */
+        return false;
+    }
+    if (s->async) {
+        /* A failed push from before the claim would otherwise be thrown at the first drawing after the release:
+           its region is sent again by that flush instead. */
+        display_rect_t r;
+        if (display_flush_take_error(&s->flush, &r) != BM_OK) {
+            display_fb_mark(&s->fb, r.x0, r.y0, r.x1, r.y1);
+        }
+    }
+    snprintf(s->owner, sizeof s->owner, "%s", owner);
+    s->notify = notify;
+    s->notify_arg = arg;
+    return true;
+}
+
+void display_release(zend_object *obj)
+{
+    display_surface_t *s = display_surface_find(obj);
+    if (s && s->owner[0]) {
+        s->owner[0] = '\0';
+        s->notify = NULL;
+        s->notify_arg = NULL;
+        display_fb_mark(&s->fb, 0, 0, s->fb.w, s->fb.h);   /* the renderer changed the picture: send it all */
+    }
+}
+
+bool display_not_claimed(const display_surface_t *s)
+{
+    if (!s->owner[0]) {
+        return true;
+    }
+    zend_throw_exception_ex(spl_ce_LogicException, 0, "%s: the panel is driven by %s; draw in a %s Canvas",
+        display_panel_name(s->obj), s->owner, s->owner);
+    return false;
 }
 
 PHP_MINIT_FUNCTION(display)
@@ -307,6 +381,6 @@ zend_module_entry display_module_entry = {
     NULL,   /* RINIT */
     NULL,   /* RSHUTDOWN */
     NULL,   /* MINFO */
-    "1.0.0",
+    "1.1.0",
     STANDARD_MODULE_PROPERTIES
 };

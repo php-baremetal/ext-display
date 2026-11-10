@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.1.0
+
+- Added: `display_text.h`, header-only text helpers (UTF-8 decoding, a GFX or extended font seen the same way, glyph lookup and advance), so a renderer that draws text itself gets the same metrics as `text()`.
+- Added: the band path of the panel contract (`display_band_ops_t`, optional: `display_panel_ops_t::band`, `NULL` for none), for renderers that compose outside the framebuffer, and `display_panel_of()` / `display_claim()` / `display_release()`: while a renderer holds the panel the drawing methods throw `\LogicException`. The band ops are declared in `display_band.h` (plain C, included by `display_panel.h`).
+- Added: `display_vsync_hook()` in the C API: a renderer's callback in the TE interrupt at every pulse, beside `onVsync()`.
+- Added: `display_band_ops_t::scan` (`display_scan_t`), the order in which the panel refreshes its picture, so a
+  renderer paced on TE can write its bands where the refresh is not reading and the picture does not tear;
+  `DISPLAY_SCAN_UNKNOWN` (0) when the driver does not set it.
+- Added: `display_claim_ex()`, `display_claim()` with a callback that tells the renderer holding the panel about
+  `sleep()` (before), `wake()` (after) and a lost picture (`display_invalidate()`), so it pauses while the panel is
+  off and sends its whole frame again after a re-initialisation.
+- Added: the band contract's failure rule: a panel that failed for good returns `BM_ERR_INVALID_STATE` from every
+  later `begin` and `push`, and only then; the renderer takes that code as final.
+
 ## 1.0.0
 
 - First release.

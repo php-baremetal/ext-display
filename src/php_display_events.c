@@ -128,6 +128,54 @@ void display_te_event(display_flush_t *f)
     if (rec && atomic_load(&rec->on)) {
         bm_events_emit_from_isr(rec->tag, s->obj);
     }
+    /* The renderer's hook (display_vsync_hook()): cb and arg read together, and busy until it returns, so that
+       the PHP task can remove it and know it no longer runs. */
+    bm_hal_lock_enter(f->lock);
+    void (*cb)(void *arg) = s->vsync_cb;
+    void *arg = s->vsync_arg;
+    if (cb) {
+        s->vsync_cb_busy++;
+    }
+    bm_hal_lock_exit(f->lock);
+    if (cb) {
+        cb(arg);
+        bm_hal_lock_enter(f->lock);
+        s->vsync_cb_busy--;
+        bm_hal_lock_exit(f->lock);
+    }
+}
+
+static void te_take(display_surface_t *s);
+
+/* Sets (or with cb NULL removes) the hook and waits until a pulse running the previous one has finished it. */
+static void vsync_hook_set(display_surface_t *s, void (*cb)(void *arg), void *arg)
+{
+    for (;;) {
+        bm_hal_lock_enter(s->flush.lock);
+        s->vsync_cb = cb;
+        s->vsync_arg = arg;
+        bool idle = s->vsync_cb_busy == 0;
+        bm_hal_lock_exit(s->flush.lock);
+        if (idle) {
+            return;   /* a pulse after this point reads the new hook */
+        }
+    }
+}
+
+bool display_vsync_hook(zend_object *obj, void (*cb)(void *arg), void *arg)
+{
+    display_surface_t *s = display_surface_find(obj);
+    if (!s || s->te < 0 || !s->flush.lock) {
+        return false;
+    }
+    vsync_hook_set(s, cb, arg);
+    if (cb) {
+        if (s->te_on && !s->te_owner) {
+            te_take(s);   /* another object on the same pin had the handler: the hook's surface takes it back */
+        }
+        display_te_attach(s);   /* after the hook: the first pulse already runs it */
+    }
+    return true;
 }
 
 static void te_isr(void *arg)
@@ -189,6 +237,9 @@ void display_te_detach(display_surface_t *s)
 
 void display_events_detach(display_surface_t *s)
 {
+    if (s->flush.lock) {
+        vsync_hook_set(s, NULL, NULL);
+    }
     __atomic_store_n(&s->flushed_rec, NULL, __ATOMIC_RELEASE);
     __atomic_store_n(&s->vsync_rec, NULL, __ATOMIC_RELEASE);
     for (display_src_rec_t *rec = s_recs; rec; rec = rec->next) {

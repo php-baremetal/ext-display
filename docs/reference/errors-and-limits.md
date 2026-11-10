@@ -26,6 +26,7 @@ short class name of the driver (`St77916`).
 | `\RuntimeException` | `unknown font '<name>' (available: default, title, icons)` | `Font::get()`: the list is every font in the firmware. |
 | `\RuntimeException` | `font '<name>' has an unsupported bpp <n>` | `Font::get()`: an extended font whose bits per pixel are not 1, 2 or 4. |
 | `\RuntimeException` | `no default font: set extra.baremetal.fonts.default to true or pass a font` | `text()`, `textWidth()` without `font:` in a firmware built with `fonts.default` set to `false`. |
+| `\LogicException` | `<Panel>: the panel is driven by <owner>; draw in a <owner> Canvas` | a drawing, `flush()` or `flushWait()` on a display whose panel a renderer holds (`display_claim()`, since 1.1). `width()`, `height()`, `rgb()`, `textWidth()`, `backlight()`, `refreshRate()`, `sleep()`, `wake()`, `onFlushed()` and `onVsync()` keep working. |
 | `\ValueError` | `<Class>::image(): Argument #3 ($w) must be between 0 and 65536` (`#4 ($h)` likewise) | `image()` |
 | `\ValueError` | `<Class>::image(): Argument #5 ($pixels) must be N bytes long (w * h * 2), got M` | `image()` |
 | `\ValueError` | `<Class>::backlight(): Argument #1 ($level) must be between 0 and 255` | `backlight()` |

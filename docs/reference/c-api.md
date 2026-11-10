@@ -14,8 +14,8 @@ next: { label: 'No next page', href: '#' }
 A panel driver owns the bus and the panel's start-up sequence; ext-display owns the framebuffer, the drawing and
 the PHP methods. The driver describes its panel with `display_panel_ops_t`, attaches a surface to its PHP object
 in the constructor, and puts the `Output\Display` methods in its class (`display_methods_with()` or `DISPLAY_FE`). Headers: `display_panel.h` (the contract),
-`display_job.h` (the asynchronous flush, plain C, included by `display_panel.h`) and `display_font.h` (font
-formats and the `display_fonts[]` table).
+`display_job.h` (the asynchronous flush, plain C, included by `display_panel.h`), `display_font.h` (font
+formats and the `display_fonts[]` table) and `display_text.h` (UTF-8 and glyph lookup, see [Fonts](#fonts)).
 
 ## The panel
 
@@ -36,6 +36,8 @@ typedef struct {
     /* Asynchronous flush (both NULL for a synchronous panel, which only has push). */
     bool (*begin)(void *panel, const display_job_t *job);
     bool (*wait)(void *panel, uint32_t ms);
+    /* since 1.1, last in the struct */
+    const display_band_ops_t *band;   /* NULL: no band path */
 } display_panel_ops_t;
 
 typedef struct {
@@ -55,6 +57,8 @@ typedef struct {
 - `refresh_hz` is what `refreshRate()` returns: the panel's nominal refresh rate in Hz, `0` (the value a designated initialiser leaves) when the driver does not know it. Nothing in ext-display uses it.
 - `begin` and `wait` make the flush asynchronous; see [Asynchronous flush](#asynchronous-flush). A driver without
   them stays synchronous with `push`.
+- `band` (since 1.1) is the optional [band path](#band-path). Always initialise `display_panel_ops_t` with designated
+  initialisers: a field you do not name is `NULL`, so a driver written for 1.0 has no band path.
 - `format` must be `DISPLAY_FORMAT_RGB565`. `caps` is reserved for hardware features; nothing uses
   `DISPLAY_CAP_HW_SCROLL` yet.
 
@@ -68,7 +72,11 @@ typedef struct {
 | `extern const zend_function_entry display_methods[]` | The `Output\Display` methods, terminated by `ZEND_FE_END`, with the interface's arginfo. |
 | `const zend_function_entry *display_methods_with(const zend_function_entry *own)` | `own` followed by `display_methods`, in a table that lives until the process ends: use it when the class's method table is built at start-up. |
 | `DISPLAY_FE` | The same methods as `zend_function_entry` initialisers, for a static table: `static const zend_function_entry t[] = { PHP_ME(...) DISPLAY_FE PHP_FE_END };`. Use it when the table must exist before start-up, as in an ext-spi driver descriptor (`spi_driver_desc_t.methods`). |
-| `void display_invalidate(void *panel)` | Marks the whole screen of every surface attached with `panel` as changed, so the next `flush()` sends the full frame. For a driver whose panel lost its picture, for example after a re-initialisation in `sleep(panel, false)`. |
+| `void display_invalidate(void *panel)` | Marks the whole screen of every surface attached with `panel` as changed, so the next `flush()` sends the full frame. For a driver whose panel lost its picture, for example after a re-initialisation in `sleep(panel, false)`. A renderer that holds the panel gets `DISPLAY_PANEL_LOST` (see Renderers) and sends its whole frame again. PHP task only. |
+| `void display_panel_of(zend_object *obj, const display_panel_ops_t **ops, void **panel)` | Since 1.1. The ops and the driver's `panel` behind a display object, for a [renderer](#renderers); `*ops` is `NULL` when `obj` is not a display or has no surface. |
+| `bool display_claim(zend_object *obj, const char *owner)` | Since 1.1. Takes the panel for `owner`; see [Renderers](#renderers). PHP task only. |
+| `bool display_claim_ex(zend_object *obj, const char *owner, void (*notify)(void *arg, display_panel_event_t event), void *arg)` | Since 1.1. `display_claim()` with a callback for sleep, wake and a lost picture (`display_panel_event_t`); see [Renderers](#renderers). PHP task only. |
+| `void display_release(zend_object *obj)` | Since 1.1. Gives the panel back: the next `flush()` sends the full frame. |
 | `zend_class_entry *display_ce(void)` | `Baremetal\Output\Display`, for `zend_class_implements()`. |
 | `const char *display_panel_name(zend_object *obj)` | The short class name, for messages. |
 
@@ -185,6 +193,148 @@ void my_panel_register(void)   /* from the driver's MINIT, after ext-display's *
 ```
 <!-- @endcode-block -->
 
+## Band path
+
+Since 1.1 a driver can offer a second way to put a picture on its panel, for a renderer that composes outside the
+framebuffer and sends it band by band. The surface's own `flush()` never uses it. Point `display_panel_ops_t::band`
+at a `display_band_ops_t` that lives as long as the panel (a copy in the driver's state when a field depends on the
+panel's settings, as `scan` does). The type is in `display_band.h`, which `display_panel.h`
+includes; it is plain C (no `php.h`), so a renderer's core can be built and tested without PHP:
+
+<!-- @code-block language="c" label="display_band.h" -->
+```c
+typedef enum {
+    DISPLAY_SCAN_UNKNOWN = 0,
+    DISPLAY_SCAN_TOP_DOWN,     /* row 0 first; the refresh starts at the TE pulse (its falling edge) */
+    DISPLAY_SCAN_BOTTOM_UP,    /* the last row first */
+    DISPLAY_SCAN_LEFT_RIGHT,   /* column 0 first (a panel turned by 90 degrees) */
+    DISPLAY_SCAN_RIGHT_LEFT,   /* the last column first */
+} display_scan_t;
+
+typedef struct {
+    uint16_t rows;          /* rows per band the driver advises (e.g. 40) */
+    uint32_t bytes_max;     /* largest band the driver accepts, in bytes */
+    bool own_ram;           /* the panel keeps its picture; false: the driver copies bands into its frame */
+    display_scan_t scan;    /* the refresh order; DISPLAY_SCAN_UNKNOWN when not set */
+    void *(*buf_alloc)(void *panel, size_t bytes);
+    void (*buf_free)(void *panel, void *px);
+    bm_err_t (*begin)(void *panel, int x0, int y0, int x1, int y1);
+    bm_err_t (*push)(void *panel, int y0, int rows, const void *px, void (*done)(void *arg), void *arg);
+    bm_err_t (*end)(void *panel);
+} display_band_ops_t;
+```
+<!-- @endcode-block -->
+
+A region `[x0, x1) x [y0, y1)` is sent as `begin`, then `push` for each band from top to bottom, then `end`. The rules:
+
+- **Threading.** `begin`, `push`, `end`, `buf_alloc` and `buf_free` are called by one task of the renderer, never from an
+  ISR and never concurrently with each other.
+- **Coordinates.** The region goes to `begin` in panel coordinates. The `y0` of `push` is a panel row inside the
+  region. Every band spans the region's full width (`x1 - x0`), and the bands go top to bottom. `rows * (x1 - x0) * 2`
+  never exceeds `bytes_max`; `rows` in the struct is the height the driver advises.
+- **Buffers.** The renderer gets the band buffers from `buf_alloc(panel, bytes)` (`bytes <= bytes_max`; `NULL` without
+  memory), so the driver picks DMA-capable internal RAM and its alignment. `px` of `push` is such a buffer, RGB565,
+  high byte first like `ops->push`, with contiguous rows of `x1 - x0` pixels. `buf_free(panel, px)` takes it back, after
+  its `done` ran or its `push` failed.
+- **Pipelining.** `push` may be called again before the previous `done`. The driver accepts at least 2 bands in
+  flight; when it cannot take one more it blocks inside `push` until it can. `done(arg)` runs exactly once for each
+  accepted `push`, in push order, in a task (never in an ISR: a driver whose DMA ends in an ISR defers `done` to a
+  task), and must be short.
+- **Errors.** A `push` that returns an error did not take the band: `done` is not called and `px` is free at once.
+  A panel that failed for good (a transfer that never ended, for example) makes every later `begin` and `push`
+  return `BM_ERR_INVALID_STATE`, and only such a panel returns that code: the renderer takes it as final and stops
+  sending (Slate throws `\RuntimeException` `Slate: the panel refused the bands (error 0x103)`). Any other error is
+  transient, and the renderer may send the band again later.
+- **`end`.** It returns once every band of the region has been accepted; it does not wait for `done`. The next
+  `begin` may follow at once, and the driver processes regions in order.
+- **`own_ram`.** `true` when the panel keeps what it received. `false`: the driver copies the bands into its own
+  frame, and the picture may appear at the driver's next frame (a buffer swap at the TE pulse, for example) after
+  `end`.
+- **TE.** The band path does not wait for TE; a renderer paces itself on the TE pulses (`display_vsync_hook()`,
+  below, or `onVsync()`).
+- **`scan`.** The order in which the panel refreshes its picture from its RAM, once per TE period, in panel
+  coordinates: the driver derives it from its orientation (a panel mirrored vertically scans `DISPLAY_SCAN_BOTTOM_UP`,
+  one with its axes swapped scans across the columns). A renderer that paces itself on TE uses it to write each band
+  where the refresh is not reading at that moment, ahead of it or behind it, so that a moving picture does not tear.
+  `DISPLAY_SCAN_UNKNOWN` (0, what a driver that does not name the field gets) means it does not: the renderer
+  sends its bands as they come. Set it only for a panel with its own RAM (`own_ram`) whose TE pulse starts the
+  refresh. The driver itself still never waits.
+- **Sleep, wake, backlight.** They stay callable while a renderer holds the panel and ext-display does not wait for
+  the renderer's bands. A driver with a band path therefore executes `sleep` and `wake` after the bands it already
+  accepted, in the order they came. ext-display tells the renderer before `sleep` and after `wake`
+  (`display_claim_ex()`, below). A driver whose panel loses its picture (a re-initialisation on wake) calls
+  `display_invalidate()`, which tells the renderer to send its whole frame again; a driver that does not call it
+  keeps what the bands wrote, also while the panel sleeps.
+- The TE pin stays as it is: the surface attached with `te:` raises `onVsync()` as before.
+- Use the band path on a panel only while it is claimed (below): the surface's flushes and the band path are not
+  meant to be used together.
+
+## Renderers
+
+A renderer that drives the panel itself (a scene compositor, for example) works on the panel behind a display
+object and keeps the display's drawing methods out of the way:
+
+1. `display_panel_of(obj, &ops, &panel)` gives the ops and the driver's panel pointer; check `ops->band`.
+2. `display_claim(obj, "Slate")` takes the panel for an owner: a short name used in messages (31 bytes are kept).
+   The flushes in flight end first (as in `display_quiesce()`). It returns `false`, claiming nothing, when
+   another owner holds the panel, when `obj` has no surface, or when the flush in flight does not end in time.
+3. While the panel is claimed, `clear()`, `pixel()`, `line()`, `rect()`, `fillRect()`, `circle()`, `fillCircle()`,
+   `text()`, `image()`, `flush()` and `flushWait()` throw `\LogicException`
+   `<Class>: the panel is driven by <owner>; draw in a <owner> Canvas`. `width()`, `height()`, `rgb()`,
+   `textWidth()`, `backlight()`, `refreshRate()`, `sleep()`, `wake()`, `onFlushed()` and `onVsync()` keep
+   working; `onFlushed()` raises nothing while the panel is claimed, because no flush happens.
+4. The renderer keeps a reference on `obj` for as long as it holds the claim: the surface, the owner and the
+   `ops` and `panel` of `display_panel_of()` go with the object. A driver does not attach a claimed object again
+   (that drops the claim).
+5. `display_claim_ex(obj, owner, notify, arg)` is `display_claim()` with a callback for what happens to the panel
+   while it is claimed (`display_claim()` is `display_claim_ex()` with `notify` `NULL`):
+
+   <!-- @code-block language="c" label="display_panel.h" -->
+   ```c
+   typedef enum {
+       DISPLAY_PANEL_SLEEP = 1,   /* sleep() is about to turn the panel off */
+       DISPLAY_PANEL_WAKE,        /* wake() turned it on again, or a sleep() failed */
+       DISPLAY_PANEL_LOST,        /* the panel lost its picture (display_invalidate()) */
+   } display_panel_event_t;
+   bool display_claim_ex(zend_object *obj, const char *owner,
+                         void (*notify)(void *arg, display_panel_event_t event), void *arg);
+   ```
+   <!-- @endcode-block -->
+
+   `notify(arg, event)` runs on the PHP task inside `sleep()`, `wake()` and `display_invalidate()`, until
+   `display_release()`; it must be short and must not call PHP. `DISPLAY_PANEL_SLEEP` comes before the driver's
+   `sleep` op (a renderer pauses its frames: a panel that is off shows nothing, and its TE pulses stop);
+   `DISPLAY_PANEL_WAKE` after a `wake` that succeeded, and after a `sleep` that failed; `DISPLAY_PANEL_LOST` when the
+   driver calls `display_invalidate()`, so a driver that re-initialises the panel on wake gives `LOST`, then `WAKE`.
+   Slate redraws the whole screen on `LOST` and starts no new frame between `SLEEP` and `WAKE` (one under way finishes).
+6. `display_release(obj)` gives the panel back. The renderer has changed the picture, so the next `flush()` sends
+   the full frame. A failed push of the display's own flush that was still unreported at the claim is not thrown
+   later: its region is sent again by that flush.
+
+A renderer that paces itself on the panel's TE pulses sets a hook:
+
+<!-- @code-block language="c" label="display_panel.h" -->
+```c
+bool display_vsync_hook(zend_object *obj, void (*cb)(void *arg), void *arg);
+```
+<!-- @endcode-block -->
+
+- `cb(arg)` runs in the TE interrupt at every pulse, so it does only ISR-safe work, such as
+  `bm_hal_queue_send_isr()` to wake the renderer's task.
+- It coexists with `onVsync()` and with the vsync flushes of the surface, and keeps running while the panel is
+  claimed.
+- One hook per display object: a new call replaces it, `cb` `NULL` removes it. When the call returns, the previous
+  hook is not running and does not run again (the call waits for a pulse in progress), so the renderer can free
+  `arg` right after removing it.
+- The first hook attaches the TE interrupt; it then stays attached, as after `onVsync()`. The hook goes with the
+  surface (the object freed, or attached again).
+- A TE pin has one interrupt handler. Setting the hook takes the pin for `obj`. When another display object on the
+  same pin takes it later (its first `onVsync()`, or an attach with `vsync`), the hook stops getting pulses until
+  it is set again. A renderer should not depend on the pulses alone: Slate falls back to its own timer when the
+  pulses stop.
+- `false` when `obj` is not a display or the display has no TE pin (`te:`); the renderer then paces itself
+  another way. PHP task only.
+
 ## Fonts
 
 `display_font.h` declares the Adafruit GFX types (`GFXfont`, `GFXglyph`, read as `fontconvert` writes them),
@@ -202,6 +352,12 @@ extern const size_t display_fonts_count;
 Glyphs follow Adafruit GFX: `yOffset` from the baseline to the glyph's top row, `xOffset` from the cursor,
 `xAdvance` to the next character; bitmap rows top to bottom, `bpp` bits per pixel packed MSB first. A GFX font's
 ascent is the highest glyph's `-yOffset`.
+
+`display_text.h` (header only, plain C) reads text the way `text()` does, for a renderer that draws glyphs
+itself: `display_text_utf8()` (next codepoint, U+FFFD for an invalid or truncated sequence),
+`display_text_font_entry()` / `_gfx()` / `_ext()` (a `display_text_font_t` view of either format, `false` for an
+extended font whose `bpp` is not 1, 2 or 4), `display_text_glyph()` (the glyph of a codepoint, or `NULL`) and
+`display_text_advance()` (a missing glyph is drawn as a box half the line height wide).
 
 For an asynchronous driver, `my_ops` also sets `.begin` and `.wait`, the constructor calls `display_attach_ex()`
 with the options it takes (`buffered`, `vsync`, `te`), and its `free_obj` calls `display_quiesce()` before it

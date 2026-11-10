@@ -16,11 +16,13 @@
  */
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "php.h"
 #include "bm_err.h"
 #include "display_job.h"
+#include "display_band.h"
 
 #ifndef BM_ERR_INVALID_ARG
 #define BM_ERR_INVALID_ARG 0x102   /* same value as ESP_ERR_INVALID_ARG */
@@ -29,6 +31,8 @@
 typedef enum { DISPLAY_FORMAT_RGB565 = 1, DISPLAY_FORMAT_MONO1 = 2 } display_format_t;
 
 #define DISPLAY_CAP_HW_SCROLL 0x1u
+
+/* display_band_ops_t, the band path: display_band.h (plain C, without php.h, for renderers built apart). */
 
 typedef struct {
     uint16_t width, height;
@@ -46,6 +50,8 @@ typedef struct {
                                                                ms pass; false on timeout. ext-display calls it in
                                                                a loop with a short ms under its own 2000 ms
                                                                deadline, and ignores the result */
+    /* since 1.1, at the end so that a driver built for 1.0 (designated initialisers) leaves it NULL */
+    const display_band_ops_t *band;   /* NULL: no band path */
 } display_panel_ops_t;
 
 /* Options of display_attach_ex(). */
@@ -73,8 +79,49 @@ bm_err_t display_attach(zend_object *obj, const display_panel_ops_t *ops, void *
 void display_quiesce(void *panel);
 
 /* Marks the whole screen of every surface attached with this panel as changed, so the next flush() sends the
-   full frame: for a driver whose panel lost its picture (a re-initialisation on wake, for example). */
+   full frame: for a driver whose panel lost its picture (a re-initialisation on wake, for example). A renderer
+   that holds the panel gets DISPLAY_PANEL_LOST (display_claim_ex()). PHP task only. */
 void display_invalidate(void *panel);
+
+/* For a renderer that drives the panel itself (Slate), since ext-display 1.1. Gives the panel behind a display
+   object: its ops and the driver's panel pointer; *ops is NULL when obj is not a display (or has no surface). */
+void display_panel_of(zend_object *obj, const display_panel_ops_t **ops, void **panel);
+/* Takes the panel for owner (a short name for messages, e.g. "Slate"; at most 31 bytes are kept): the flushes in
+   flight end first (display_quiesce()); from now the drawing methods of the display object, flush() and
+   flushWait() throw \LogicException "<Class>: the panel is driven by <owner>; draw in a <owner> Canvas".
+   width(), height(), rgb(), textWidth(), backlight(), refreshRate(), sleep(), wake(), onFlushed() and onVsync()
+   keep working. false when another owner holds the panel, when obj has no surface, or when the flush in flight
+   did not end in time. PHP task only. The renderer holds a reference on obj for as long as it holds the claim
+   (ops and panel from display_panel_of() are valid only while obj lives), and a driver does not attach a claimed
+   object again (that drops the claim). */
+bool display_claim(zend_object *obj, const char *owner);
+/* What happened to a claimed panel, for the renderer that holds it (since ext-display 1.1). */
+typedef enum {
+    DISPLAY_PANEL_SLEEP = 1,   /* sleep() is about to turn the panel off: what is sent until DISPLAY_PANEL_WAKE
+                                  may not show (a renderer starts no new frame; one under way may finish) */
+    DISPLAY_PANEL_WAKE,        /* wake() turned the panel on again, or a sleep() failed: frames may go again */
+    DISPLAY_PANEL_LOST,        /* the panel lost its picture (display_invalidate()): send the whole frame again */
+} display_panel_event_t;
+/* display_claim() with a callback: notify(arg, event) runs on the PHP task, inside sleep(), wake() and
+   display_invalidate(), for as long as the claim lasts (display_release() ends it); it must be short and must not
+   call PHP. SLEEP comes before the driver's sleep op; WAKE after a wake op that succeeded (and after a sleep op
+   that failed); a driver that re-initialises the panel on wake calls display_invalidate() inside it, so LOST
+   comes before WAKE. notify NULL: display_claim(). */
+bool display_claim_ex(zend_object *obj, const char *owner, void (*notify)(void *arg, display_panel_event_t event),
+                      void *arg);
+/* Gives the panel back: the next flush() sends the full frame. */
+void display_release(zend_object *obj);
+
+/* For a renderer that paces itself on the panel's TE pulses (Slate), since ext-display 1.1: cb(arg) runs in the TE
+   interrupt at every pulse, so it may only do ISR-safe work (e.g. bm_hal_queue_send_isr()); it coexists with
+   onVsync() and with the vsync flushes. One hook per display object: a new one replaces the previous, cb NULL
+   removes it. Once a call returns, the previous hook is not running and does not run again (the call waits for a
+   pulse in progress). The TE interrupt is attached at the first hook and stays attached, as with onVsync(); the
+   hook goes with the surface (a new display_attach() of obj, or obj freed). A TE pin has one handler: setting the
+   hook takes it for obj, and when another display object on the same pin takes it later (its first onVsync(), or
+   an attach with vsync) the hook stops getting pulses; set it again to take the pin back. false when obj is not
+   a display or the display has no TE pin. PHP task only. */
+bool display_vsync_hook(zend_object *obj, void (*cb)(void *arg), void *arg);
 
 /* The methods of Output\Display, for the driver class's method table (terminated by ZEND_FE_END). */
 extern const zend_function_entry display_methods[];

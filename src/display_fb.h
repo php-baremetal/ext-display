@@ -13,7 +13,7 @@
 
 /*
  * The RGB565 framebuffer: primitives clipped to the screen, the dirty rectangle, UTF-8 text with GFX and
- * extended fonts. Plain C, no Zend: tools/host-c/cases/ext-display tests it on the PC.
+ * extended fonts. Plain C, no Zend, so it can be tested on a PC.
  */
 #pragma once
 #include <stdbool.h>
@@ -21,6 +21,7 @@
 #include <stdint.h>
 
 #include "display_font.h"
+#include "display_text.h"
 
 /* 1 (default): the framebuffer holds pixels in the panel's byte order (swapped at every write), so a
    full-width region is pushed straight from it. Measured on a 360x360 QSPI panel: a full flush takes 38 ms
@@ -38,15 +39,8 @@ typedef struct {
     display_fb_rect_t dirty; /* empty when x0 >= x1 */
 } display_fb_t;
 
-/* A GFX or extended font, seen the same way. GFX fonts have one range (gfx_first..gfx_last, ranges NULL). */
-typedef struct {
-    const uint8_t *bitmap;
-    const GFXglyph *glyph;
-    const display_font_range_t *ranges;
-    uint16_t range_count;
-    uint32_t gfx_first, gfx_last;
-    uint8_t bpp, line_height, ascent;
-} display_fb_font_t;
+/* A GFX or extended font, seen the same way (display_text.h). */
+typedef display_text_font_t display_fb_font_t;
 
 static inline uint16_t display_fb_store(uint16_t c)
 {
@@ -88,14 +82,17 @@ void display_fb_emit(const display_fb_t *fb, int x0, int y0, int x1, int y1, uin
    NULL otherwise. */
 const uint8_t *display_fb_direct(const display_fb_t *fb, int x0, int y0, int x1);
 
-/* The next codepoint of [*p, end), advancing *p; an invalid or truncated sequence is U+FFFD (one byte). */
-uint32_t display_fb_utf8(const char **p, const char *end);
-
-void display_fb_font_gfx(display_fb_font_t *f, const GFXfont *gfx);
-/* false for a bpp other than 1, 2 or 4: the font cannot be drawn. */
-bool display_fb_font_ext(display_fb_font_t *f, const display_font_t *ext);
-/* The glyph of a codepoint, or NULL. */
-const GFXglyph *display_fb_glyph(const display_fb_font_t *f, uint32_t cp);
+/* The text helpers of display_text.h under the framebuffer's names. */
+static inline uint32_t display_fb_utf8(const char **p, const char *end) { return display_text_utf8(p, end); }
+static inline void display_fb_font_gfx(display_fb_font_t *f, const GFXfont *gfx) { display_text_font_gfx(f, gfx); }
+static inline bool display_fb_font_ext(display_fb_font_t *f, const display_font_t *ext)
+{
+    return display_text_font_ext(f, ext);
+}
+static inline const GFXglyph *display_fb_glyph(const display_fb_font_t *f, uint32_t cp)
+{
+    return display_text_glyph(f, cp);
+}
 
 /* Draws s with y the top of the line; bg < 0 is transparent. Returns the width in pixels. */
 int display_fb_text(display_fb_t *fb, int x, int y, const char *s, size_t len, uint16_t fg, int bg,

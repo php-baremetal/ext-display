@@ -51,10 +51,22 @@ struct display_surface {
     bool te_on;          /* the surface wants the TE pulses (vsync, or the first onVsync()) */
     bool te_owner;       /* the pin's interrupt handler is this surface's: one handler per pin, the last to attach */
     display_surface_t *te_next;   /* the list of the surfaces with te_on (php_display_events.c) */
+    char owner[32];      /* the renderer that claimed the panel (display_claim()); "" when nobody did */
+    void (*notify)(void *arg, display_panel_event_t event);   /* the renderer's (display_claim_ex()); NULL: none */
+    void *notify_arg;
     bool obj_held;       /* a reference on obj, taken by the first onFlushed()/onVsync(): queued events carry it */
     struct display_src_rec *flushed_rec;   /* the active record of onFlushed(), NULL without one */
     struct display_src_rec *vsync_rec;     /* the active record of onVsync(), NULL without one */
+    void (*vsync_cb)(void *arg);           /* display_vsync_hook(): called in the TE interrupt; under flush.lock */
+    void *vsync_arg;
+    int vsync_cb_busy;                     /* the hook is running (under flush.lock) */
 };
+
+/* Throws LogicException "<Class>: the panel is driven by <owner>; draw in a <owner> Canvas" and returns false when
+   a renderer holds the panel. */
+bool display_not_claimed(const display_surface_t *s);
+/* Tells the renderer that holds the panel (display_claim_ex()) what happened to it; nothing without one. */
+void display_notify(display_surface_t *s, display_panel_event_t event);
 
 /* Waits until done(s, arg) holds, calling ops->wait(panel, DISPLAY_WAIT_SLICE_MS) in between (its result is
    ignored), for at most DISPLAY_WAIT_MS in all; false on the deadline, without throwing. */
@@ -66,6 +78,9 @@ void display_flushed(display_flush_t *f, display_rect_t r, bm_err_t err, uint32_
 
 /* The surface of a driver object; throws Error "<Class> is not initialised" and returns NULL without one. */
 display_surface_t *display_surface(zend_object *obj);
+
+/* The same without throwing: NULL when obj (NULL allowed) has no surface. */
+display_surface_t *display_surface_find(zend_object *obj);
 
 void display_surfaces_startup(void);
 void display_surfaces_shutdown(void);
