@@ -33,7 +33,7 @@ low 16 bits are used).
 | `flush(?int $x0 = null, ?int $y0 = null, ?int $x1 = null, ?int $y1 = null): void` | Sends the framebuffer to the panel; see below. |
 | `flushWait(): void` | Returns when no flush is in flight or pending; throws the error of one that failed. |
 | `onFlushed(string $event): Baremetal\Source` | Raises `$event` at the end of every region sent; see [Events](#events). |
-| `onVsync(string $event): Baremetal\Source` | Raises `$event` at every pulse of the panel's TE pin; see [Events](#events). |
+| `onVsync(string $event): Baremetal\Source` | Raises `$event` at every pulse of the panel's TE pin (since 1.2, or at every frame pulse of a driver that gives them, such as an RGB panel's); see [Events](#events). |
 | `backlight(int $level): void` | 0 (off) to 255; nothing on a panel without a backlight. |
 | `sleep(): void`, `wake(): void` | The panel's sleep mode; nothing on a panel without one. |
 | `refreshRate(): float` | The panel's nominal refresh rate in Hz, or `0.0` when the driver does not say. It is the datasheet or configured rate, not a measurement. |

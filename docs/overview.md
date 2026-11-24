@@ -148,6 +148,10 @@ constructor):
 
 The TE pin belongs to the display: a `watch_gpio()` on the same pin takes the interrupt away from it.
 
+An RGB panel (since 1.2, through a driver of the `display_drivers` registry) draws straight into the framebuffer
+the panel scans: `flush()` only makes the changed rectangle visible, and `onVsync()` follows the panel's vsync
+with no TE pin.
+
 ## Events
 
 Two methods turn the display into an event source of [ext-events](package:php-baremetal/ext-events). Each returns
@@ -245,9 +249,42 @@ Text is UTF-8; `y` is the top of the line. Anti-aliased glyphs blend against `bg
 pixel is drawn when it is more than half covered. A character the font does not have is drawn as a hollow box
 half the line height wide.
 
+## The display-surface option
+
+`display-surface` (bool, default `true`) in `extra.baremetal.options` of the project's `composer.json` turns the
+drawing surface off. Turn it off when a renderer such as Slate draws on the panel and nothing draws on the display
+directly: on a turned MIPI-DSI panel the surface keeps its own framebuffer (`width * height * 2` bytes of PSRAM:
+1800 KB on a 720 x 1280 panel), which the build reserves only while the option is on.
+
+```json
+{
+  "extra": {
+    "baremetal": {
+      "options": {
+        "display-surface": false
+      }
+    }
+  }
+}
+```
+
+With the option off:
+
+- A driver attaches without the surface: nothing is allocated for it (no framebuffer, no band, no copy), and the build
+  does not reserve the turned panel's surface framebuffer.
+- A renderer still claims the panel and drives it (Slate works as before).
+- Every method that draws or sends throws `\Error` `<Panel>: the drawing surface is off: set
+  extra.baremetal.options.display-surface to true to draw on the panel directly (a renderer such as Slate draws
+  without it)`: the drawing methods, `image()`, `flush()` and `flushWait()`. The same on a panel whose surface
+  would draw in the driver's own framebuffer (rotation 0, nothing allocated anyway): off means off.
+- `width()`, `height()`, `rgb()`, `textWidth()`, `refreshRate()`, `backlight()`, `sleep()`, `wake()`,
+  `onFlushed()` and `onVsync()` keep working.
+
+C code reads it as `PHPBM_OPTION_DISPLAY_SURFACE` (1 or 0) in `phpbm_options.h`.
+
 ## Notes
 
 - The framebuffer takes `width * height * 2` bytes outside `memory_limit` (259 200 bytes for 360 x 360), freed
-  with the panel object.
+  with the panel object (nothing with the `display-surface` option off).
 - With `buffered`, the copy takes as much again, also outside `memory_limit`.
 - See [Errors and limits](./reference/errors-and-limits.md) for every message and size.

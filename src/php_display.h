@@ -28,6 +28,21 @@
 #define DISPLAY_BAND_BYTES 14400
 #endif
 
+/* The display-surface option (extra.baremetal.options; PHPBM_OPTION_DISPLAY_SURFACE in phpbm_options.h, 1 without
+   it). 0: a driver attaches without the drawing surface. Nothing is allocated for it (no framebuffer of the surface,
+   no copy, no band), a renderer (Slate) still claims and drives the panel, and every method that draws or sends
+   (the drawing primitives, image(), flush(), flushWait()) throws Error (display_surface_on()). The same with a
+   driver whose framebuffer the surface would draw in (rotation 0): off means off. */
+#if defined(__has_include)
+#if __has_include("phpbm_options.h")
+#include "phpbm_options.h"
+#endif
+#endif
+#ifndef PHPBM_OPTION_DISPLAY_SURFACE
+#define PHPBM_OPTION_DISPLAY_SURFACE 1
+#endif
+#define DISPLAY_SURFACE_ON (PHPBM_OPTION_DISPLAY_SURFACE != 0)
+
 extern zend_module_entry display_module_entry;
 
 /* How long a drawing, flushWait(), sleep(), wake() or backlight() waits in all for the flush before it throws
@@ -47,9 +62,13 @@ struct display_surface {
     display_flush_t flush;
     bool buffered;
     uint16_t *copy;      /* buffered: what the panel reads, w*h pixels like fb.px; NULL otherwise */
+    bool own_fb;         /* fb.px is the driver's framebuffer (ops->fb): never freed here, flush() only syncs it */
+    bool off;            /* display-surface off: no drawing surface (fb.px NULL or the driver's, no band, no copy) */
     int te;              /* GPIO of the TE pin, -1 without one */
+    bool te_drv;         /* no TE pin: the driver gives the pulses (display_attach_opts_t::te_driver) */
     bool te_on;          /* the surface wants the TE pulses (vsync, or the first onVsync()) */
-    bool te_owner;       /* the pin's interrupt handler is this surface's: one handler per pin, the last to attach */
+    bool te_owner;       /* the pin's interrupt handler (or the driver's pulses) is this surface's: one per pin or
+                            panel, the last to attach */
     display_surface_t *te_next;   /* the list of the surfaces with te_on (php_display_events.c) */
     char owner[32];      /* the renderer that claimed the panel (display_claim()); "" when nobody did */
     void (*notify)(void *arg, display_panel_event_t event);   /* the renderer's (display_claim_ex()); NULL: none */
@@ -65,6 +84,9 @@ struct display_surface {
 /* Throws LogicException "<Class>: the panel is driven by <owner>; draw in a <owner> Canvas" and returns false when
    a renderer holds the panel. */
 bool display_not_claimed(const display_surface_t *s);
+/* Throws Error "<Class>: the drawing surface is off: set extra.baremetal.options.display-surface to true ..." and
+   returns false when the firmware was built with the display-surface option off. */
+bool display_surface_on(const display_surface_t *s);
 /* Tells the renderer that holds the panel (display_claim_ex()) what happened to it; nothing without one. */
 void display_notify(display_surface_t *s, display_panel_event_t event);
 
@@ -90,8 +112,11 @@ void display_events_register(void);
 /* MSHUTDOWN, after the surfaces: frees the records of onFlushed() and onVsync(). */
 void display_events_shutdown(void);
 /* The surface's TE interrupt, attached once (vsync, or the first onVsync()). The pin has one handler: the
-   surface takes it from another surface on the same pin. */
-void display_te_attach(display_surface_t *s);
+   surface takes it from another surface on the same pin. With te_drv the same for the driver's pulses of the
+   panel; false when no place is left for another driver-signalled panel (DISPLAY_DRV_TE_MAX). */
+bool display_te_attach(display_surface_t *s);
+/* With te_drv: whether the panel has (or can get) a place for the driver's pulses. */
+bool display_te_drv_room(void *panel);
 /* The surface goes: no more events from it, and its records stop pointing at it. Before it is quiesced. */
 void display_events_detach(display_surface_t *s);
 /* Detaches the TE interrupt (after the surface is quiesced: a vsync region still needs the pulses until then).
@@ -102,6 +127,7 @@ void display_events_flushed(display_surface_t *s, display_rect_t r, bm_err_t err
 void display_te_event(display_flush_t *f);
 
 void display_interface_register(void);   /* Baremetal\Output\Display */
+void display_driver_classes_register(void);   /* Baremetal\Display\Driver\*, from the display_drivers registry */
 void display_font_class_register(void);  /* Baremetal\Display\Font */
 
 extern zend_class_entry *display_font_ce;

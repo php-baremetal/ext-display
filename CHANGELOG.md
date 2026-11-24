@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.2.0
+
+- Added: the `display-surface` option (bool, default `true`, `PHPBM_OPTION_DISPLAY_SURFACE`). `false`: a driver
+  attaches without the drawing surface and nothing is allocated for it (no framebuffer, band or copy; with the SDK,
+  the turned MIPI-DSI panel's surface framebuffer is not reserved either); a renderer still claims and drives the
+  panel; every drawing method, `image()`, `flush()` and `flushWait()` throws `\Error` naming the option, also on a
+  panel whose surface would draw in the driver's framebuffer.
+- Added: the display_drivers registry (`display_driver_desc_t`): a panel driver outside the bus extensions gets its class `Baremetal\Display\Driver\<Name>`, an Output\Display.
+- Added: `display_panel_ops_t::fb`: a driver whose panel scans a framebuffer by itself gives it, the surface draws there and allocates none, and flush() only makes the changed rectangle visible.
+- Added: `display_attach_opts_t::te_driver` and `display_te_pulse()`: the frame pulses of a panel without a TE pin (an RGB panel's vsync) feed onVsync(), the vsync flushes and display_vsync_hook().
+- Added: a double buffer on the band path (`display_band_ops_t::frames`, `present`, `show_main`): the bands go to
+  a hidden frame, `present()` shows it from the panel's next frame and the next `begin()` waits for the switch (a
+  switch that does not come within the driver's timeout gives `BM_ERR_TIMEOUT`, a transient error); the renderer
+  does not race such a panel; `display_release()` calls `show_main()`, which shows the main frame (the
+  surface's) again with the last picture. `display_attach_ex()` refuses an inconsistent set.
+- Added: `display_band_ops_t::carry` (optional, frames 2 only): the driver copies a rectangle from the frame shown
+  into the hidden frame, in place or from an offset, in order with the bands, so a renderer brings the hidden frame up
+  to date without composing the changes of the frame before again, and moves a scrolled content without composing
+  it. `display_attach_ex()` refuses it with one frame.
+- Added: `display_band_ops_t::cpu_order`: the driver takes its bands in the CPU's byte order, so the renderer does
+  not swap them.
+
 ## 1.1.0
 
 - Added: `display_text.h`, header-only text helpers (UTF-8 decoding, a GFX or extended font seen the same way, glyph lookup and advance), so a renderer that draws text itself gets the same metrics as `text()`.

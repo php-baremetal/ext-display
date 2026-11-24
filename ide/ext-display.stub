@@ -1,5 +1,5 @@
 <?php
-// php-baremetal/ext-display 1.0.0 — IDE helper, not loaded at runtime.
+// php-baremetal/ext-display 1.2.0 — IDE helper, not loaded at runtime.
 
 namespace Baremetal\Output {
     /**
@@ -9,6 +9,11 @@ namespace Baremetal\Output {
      * colors are RGB565 integers (the low 16 bits are used). Every drawing method clips to the screen without
      * errors, and a width or height of 0 or less draws nothing. Any method of an object without a surface (its
      * driver did not attach one, or the object is a clone) throws \Error "<Panel> is not initialised".
+     *
+     * In a firmware built with the display-surface option false (extra.baremetal.options), the drawing methods,
+     * image(), flush() and flushWait() throw \Error "<Panel>: the drawing surface is off: set
+     * extra.baremetal.options.display-surface to true to draw on the panel directly (a renderer such as Slate draws
+     * without it)"; a renderer still drives the panel, and the other methods keep working.
      */
     interface Display
     {
@@ -242,14 +247,16 @@ namespace Baremetal\Output {
         public function onFlushed(string $event): \Baremetal\Source;
 
         /**
-         * Raises an event at every pulse of the panel's TE pin, coalescing; a subclass of Baremetal\TimerEvent
+         * Raises an event at every pulse of the panel's TE pin (or, since 1.2, at every frame pulse its driver
+         * gives, for a panel without a TE pin such as an RGB panel), coalescing; a subclass of Baremetal\TimerEvent
          * gets $ticks.
          *
          * One class per display: a second call replaces the first.
          *
          * @param string $event The event class, which must extend Baremetal\Event.
          * @return \Baremetal\Source The handle, a Baremetal\Display\VsyncSource.
-         * @throws \ValueError When the display has no TE pin.
+         * @throws \ValueError When the display has no TE pin and no frame pulses from its driver.
+         * @throws \RuntimeException When two other panels already take frame pulses from their drivers.
          * @throws \Error When the class is unknown or the event source table is full.
          */
         public function onVsync(string $event): \Baremetal\Source;

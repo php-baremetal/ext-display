@@ -13,7 +13,8 @@
 
 /*
  * The events of a display: onFlushed() (the end of every region sent, Baremetal\Display\Flushed) and onVsync()
- * (every TE pulse, coalescing, Baremetal\TimerEvent), with their Baremetal\Source handles, and the TE interrupt.
+ * (every TE pulse, coalescing, Baremetal\TimerEvent), with their Baremetal\Source handles, and the TE interrupt:
+ * a pin's, or the pulses a driver gives with display_te_pulse() (te_driver, since 1.2).
  *
  * Each call makes a record (persistent, freed at MSHUTDOWN like the records of ext-events): the tag, whether it
  * is on, and the surface it belongs to. The surface points at its active record of each kind; a second call
@@ -29,6 +30,7 @@
 #include <string.h>
 
 #include "zend_exceptions.h"
+#include "ext/spl/spl_exceptions.h"
 #include "event_bus_php.h"
 
 typedef struct display_src_rec display_src_rec_t;
@@ -83,6 +85,12 @@ static const bm_source_ops_t s_src_ops = { src_stop, src_start, src_running, NUL
 
 /* ---- fillers ---- */
 
+/* v as a PHP int, saturated at LONG_MAX (the board's long is 32-bit; the PC's is 64-bit, where nothing saturates). */
+static long sat_long(uint64_t v)
+{
+    return v > (uint64_t)LONG_MAX ? LONG_MAX : (long)v;
+}
+
 static void flushed_fill(zend_object *event, zend_object *device, const evt_t *slot)
 {
     (void)device;
@@ -97,7 +105,7 @@ static void flushed_fill(zend_object *event, zend_object *device, const evt_t *s
     bm_events_set_long(event, s_flushed_ce, "y0", d.y0);
     bm_events_set_long(event, s_flushed_ce, "x1", d.x1);
     bm_events_set_long(event, s_flushed_ce, "y1", d.y1);
-    bm_events_set_long(event, s_flushed_ce, "us", (uint64_t)d.us > (uint64_t)LONG_MAX ? LONG_MAX : (long)d.us);
+    bm_events_set_long(event, s_flushed_ce, "us", sat_long(d.us));
 }
 
 /* TimerEvent::$ticks: this pulse plus the pulses coalesced into the event (ext-events registers its own filler
@@ -106,7 +114,7 @@ static void vsync_fill(zend_object *event, zend_object *device, const evt_t *slo
 {
     (void)device;
     uint64_t n = (uint64_t)1 + slot->merged;
-    bm_events_set_long(event, bm_events_timer_ce(), "ticks", n > (uint64_t)LONG_MAX ? LONG_MAX : (long)n);
+    bm_events_set_long(event, bm_events_timer_ce(), "ticks", sat_long(n));
 }
 
 /* ---- the hooks ---- */
@@ -147,6 +155,12 @@ void display_te_event(display_flush_t *f)
 
 static void te_take(display_surface_t *s);
 
+/* The surface has TE pulses: from a pin, or from its driver. */
+static bool has_te(const display_surface_t *s)
+{
+    return s->te >= 0 || s->te_drv;
+}
+
 /* Sets (or with cb NULL removes) the hook and waits until a pulse running the previous one has finished it. */
 static void vsync_hook_set(display_surface_t *s, void (*cb)(void *arg), void *arg)
 {
@@ -165,7 +179,7 @@ static void vsync_hook_set(display_surface_t *s, void (*cb)(void *arg), void *ar
 bool display_vsync_hook(zend_object *obj, void (*cb)(void *arg), void *arg)
 {
     display_surface_t *s = display_surface_find(obj);
-    if (!s || s->te < 0 || !s->flush.lock) {
+    if (!s || !has_te(s) || !s->flush.lock) {
         return false;
     }
     vsync_hook_set(s, cb, arg);
@@ -173,7 +187,10 @@ bool display_vsync_hook(zend_object *obj, void (*cb)(void *arg), void *arg)
         if (s->te_on && !s->te_owner) {
             te_take(s);   /* another object on the same pin had the handler: the hook's surface takes it back */
         }
-        display_te_attach(s);   /* after the hook: the first pulse already runs it */
+        if (!display_te_attach(s)) {   /* after the hook: the first pulse already runs it */
+            vsync_hook_set(s, NULL, NULL);
+            return false;
+        }
     }
     return true;
 }
@@ -185,27 +202,107 @@ static void te_isr(void *arg)
 
 /* The surfaces that want the TE pulses (te_on), the newest first; only the PHP task changes it. A pin has one
    handler (bm_hal_gpio_on_falling() replaces the previous one), so several objects on one panel share it: the
-   handler is the te_owner's, and goes to another surface of the list when its owner goes. */
+   handler is the te_owner's, and goes to another surface of the list when its owner goes. A driver-signalled
+   panel (te_drv) works the same way, with its place in s_drv_te for the handler. */
 static display_surface_t *s_te_list;
+
+#define DISPLAY_DRV_TE_MAX 2
+/* The surface that takes the pulses of each driver-signalled panel: written on the PHP task (te_take, te_detach),
+   read by display_te_pulse() in the driver's interrupt; busy counts the pulses running, so that a detach waits
+   for them. */
+static struct { void *panel; display_surface_t *_Atomic s; atomic_int busy; } s_drv_te[DISPLAY_DRV_TE_MAX];
+
+/* The place of panel, or a free one (with claim, given to panel), -1 when none; PHP task. A free place has
+   neither a panel nor a surface. */
+static int drv_slot(void *panel, bool claim)
+{
+    int free_at = -1;
+    for (int i = 0; i < DISPLAY_DRV_TE_MAX; i++) {
+        void *p = __atomic_load_n(&s_drv_te[i].panel, __ATOMIC_ACQUIRE);
+        if (p == panel && atomic_load(&s_drv_te[i].s)) {
+            return i;
+        }
+        if (free_at < 0 && !atomic_load(&s_drv_te[i].s)) {
+            free_at = i;
+        }
+    }
+    if (claim && free_at >= 0) {
+        __atomic_store_n(&s_drv_te[free_at].panel, panel, __ATOMIC_RELEASE);
+    }
+    return free_at;
+}
+
+bool display_te_drv_room(void *panel)
+{
+    return drv_slot(panel, false) >= 0;
+}
+
+/* Two surfaces share a TE source: the same pin, or the same driver-signalled panel. */
+static bool same_te(const display_surface_t *a, const display_surface_t *b)
+{
+    return a->te_drv ? b->te_drv && a->panel == b->panel : !b->te_drv && a->te == b->te;
+}
 
 static void te_take(display_surface_t *s)
 {
     for (display_surface_t *t = s_te_list; t; t = t->te_next) {
-        if (t != s && t->te == s->te) {
+        if (t != s && same_te(t, s)) {
             t->te_owner = false;
         }
     }
     s->te_owner = true;
+    if (s->te_drv) {
+        int i = drv_slot(s->panel, true);   /* display_te_attach() made sure there is one */
+        if (i >= 0) {
+            atomic_store(&s_drv_te[i].s, s);
+        }
+        return;
+    }
     bm_hal_gpio_on_falling(s->te, te_isr, s);
 }
 
-void display_te_attach(display_surface_t *s)
+bool display_te_attach(display_surface_t *s)
 {
-    if (!s->te_on && s->te >= 0 && s->flush.lock) {
-        s->te_on = true;
-        s->te_next = s_te_list;
-        s_te_list = s;
-        te_take(s);
+    if (s->te_on) {
+        return true;
+    }
+    if (!has_te(s) || !s->flush.lock || (s->te_drv && !display_te_drv_room(s->panel))) {
+        return false;
+    }
+    s->te_on = true;
+    s->te_next = s_te_list;
+    s_te_list = s;
+    te_take(s);
+    return true;
+}
+
+void display_te_pulse(void *panel)
+{
+    for (int i = 0; i < DISPLAY_DRV_TE_MAX; i++) {
+        if (__atomic_load_n(&s_drv_te[i].panel, __ATOMIC_ACQUIRE) != panel) {
+            continue;
+        }
+        atomic_fetch_add(&s_drv_te[i].busy, 1);
+        /* checked again once busy: a detach empties s, waits for busy, then frees the place; a place given to
+           another panel meanwhile is not this pulse's */
+        display_surface_t *s = atomic_load(&s_drv_te[i].s);
+        if (s && __atomic_load_n(&s_drv_te[i].panel, __ATOMIC_ACQUIRE) == panel) {
+            display_flush_te(&s->flush);
+        }
+        atomic_fetch_sub(&s_drv_te[i].busy, 1);
+        return;
+    }
+}
+
+/* Waits until no pulse of s's panel is running, so that one that read s before the place changed is over. */
+static void drv_te_wait(const display_surface_t *s)
+{
+    for (int i = 0; i < DISPLAY_DRV_TE_MAX; i++) {
+        if (__atomic_load_n(&s_drv_te[i].panel, __ATOMIC_ACQUIRE) == s->panel) {
+            while (atomic_load(&s_drv_te[i].busy) != 0) {
+                /* a pulse in the driver's interrupt: a few microseconds */
+            }
+        }
     }
 }
 
@@ -227,12 +324,27 @@ void display_te_detach(display_surface_t *s)
     }
     s->te_owner = false;
     for (display_surface_t *t = s_te_list; t; t = t->te_next) {
-        if (t->te == s->te) {
+        if (same_te(t, s)) {
             te_take(t);   /* the newest other surface on the pin: its vsync regions and onVsync() go on */
+            if (s->te_drv) {
+                drv_te_wait(s);
+            }
             return;
         }
     }
-    bm_hal_gpio_off(s->te);
+    if (!s->te_drv) {
+        bm_hal_gpio_off(s->te);
+        return;
+    }
+    for (int i = 0; i < DISPLAY_DRV_TE_MAX; i++) {
+        if (atomic_load(&s_drv_te[i].s) == s) {
+            atomic_store(&s_drv_te[i].s, NULL);   /* the panel's pulses reach nobody */
+            while (atomic_load(&s_drv_te[i].busy) != 0) {
+                /* a pulse that read s before: a few microseconds in the driver's interrupt */
+            }
+            __atomic_store_n(&s_drv_te[i].panel, NULL, __ATOMIC_RELEASE);   /* the place is free */
+        }
+    }
 }
 
 void display_events_detach(display_surface_t *s)
@@ -331,8 +443,13 @@ PHP_METHOD(Display, onVsync)
     if (!s) {
         RETURN_THROWS();
     }
-    if (s->te < 0) {
+    if (!has_te(s)) {
         zend_value_error("%s::onVsync(): the display has no TE pin", display_panel_name(s->obj));
+        RETURN_THROWS();
+    }
+    if (s->te_drv && !s->te_on && !display_te_drv_room(s->panel)) {
+        zend_throw_exception_ex(spl_ce_RuntimeException, 0,
+            "%s::onVsync(): too many panels with driver frame pulses", display_panel_name(s->obj));
         RETURN_THROWS();
     }
     uint16_t tag;
@@ -346,7 +463,7 @@ PHP_METHOD(Display, onVsync)
     if (!h) {
         RETURN_THROWS();
     }
-    display_te_attach(s);   /* after the record: the first pulse already raises the event */
+    (void)display_te_attach(s);   /* after the record: the first pulse already raises the event; room checked */
     RETURN_OBJ(h);
 }
 

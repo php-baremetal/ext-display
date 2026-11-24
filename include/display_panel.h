@@ -34,6 +34,15 @@ typedef enum { DISPLAY_FORMAT_RGB565 = 1, DISPLAY_FORMAT_MONO1 = 2 } display_for
 
 /* display_band_ops_t, the band path: display_band.h (plain C, without php.h, for renderers built apart). */
 
+/* since 1.2: the framebuffer of a driver whose panel scans it by itself (an RGB panel): the surface draws there and
+   allocates none. */
+typedef struct {
+    uint16_t *px;   /* width * height pixels, rows top to bottom, RGB565 in the CPU's byte order */
+    /* after flush(): [x0,x1) x [y0,y1) changed; make it visible to the panel (a cache writeback when the panel
+       reads memory without the cache). NULL: nothing to do. PHP task. */
+    void (*sync)(void *panel, int x0, int y0, int x1, int y1);
+} display_driver_fb_t;
+
 typedef struct {
     uint16_t width, height;
     display_format_t format;
@@ -52,23 +61,31 @@ typedef struct {
                                                                deadline, and ignores the result */
     /* since 1.1, at the end so that a driver built for 1.0 (designated initialisers) leaves it NULL */
     const display_band_ops_t *band;   /* NULL: no band path */
+    const display_driver_fb_t *fb;   /* since 1.2: NULL, the surface allocates its own framebuffer */
 } display_panel_ops_t;
 
 /* Options of display_attach_ex(). */
 typedef struct {
     bool buffered;   /* a copy of the framebuffer: flush() copies the region there and the panel reads the copy,
                         so drawings never wait for a flush */
-    bool vsync;      /* every region starts at the next TE pulse; needs te */
+    bool vsync;      /* every region starts at the next TE pulse; needs te (or te_driver) */
     int te;          /* GPIO of the panel's TE output; -1: no TE pin */
+    bool te_driver;  /* since 1.2: no TE pin, the driver calls display_te_pulse() at every frame (an RGB panel's
+                        vsync); te must be -1 */
 } display_attach_opts_t;
 
 /* Called by the driver's constructor: binds a surface (framebuffer) to the PHP object. ops and panel must
    outlive the object. Attaching again replaces the surface. With ops->begin the flushes are asynchronous
    (ops->wait is then required); a synchronous panel (no begin) ignores buffered and vsync. opts NULL: no copy,
    no vsync, no TE pin. The TE pin belongs to ext-display: it attaches bm_hal_gpio_on_falling() there (with vsync,
-   or at the first onVsync()) and detaches it when the surface goes. BM_ERR_NO_MEM without memory for
-   the framebuffer or the copy, BM_ERR_INVALID_ARG for vsync without te, BM_ERR_INVALID_STATE for a zero size,
-   a format other than RGB565, or begin without wait. */
+   or at the first onVsync()) and detaches it when the surface goes. With ops->fb (since 1.2) the surface draws in
+   the driver's framebuffer: nothing is allocated or copied (buffered is ignored), and flush() only calls
+   ops->fb->sync on the changed rectangle; such a panel is synchronous (begin must be NULL). BM_ERR_NO_MEM without
+   memory for the framebuffer or the copy (or, with te_driver, when two other panels already take driver
+   pulses), BM_ERR_INVALID_ARG for vsync without te or te_driver, or te_driver with te >= 0,
+   BM_ERR_INVALID_STATE for a zero size, a format other than RGB565, begin without wait, or fb with begin or
+   without px, or a band path with frames above 2, frames 2 without present or show_main, or present / show_main
+   with one frame. */
 bm_err_t display_attach_ex(zend_object *obj, const display_panel_ops_t *ops, void *panel,
                            const display_attach_opts_t *opts);
 /* display_attach_ex(obj, ops, panel, NULL). */
@@ -109,7 +126,8 @@ typedef enum {
    comes before WAKE. notify NULL: display_claim(). */
 bool display_claim_ex(zend_object *obj, const char *owner, void (*notify)(void *arg, display_panel_event_t event),
                       void *arg);
-/* Gives the panel back: the next flush() sends the full frame. */
+/* Gives the panel back: a double-buffered driver's show_main() runs first (display_band.h), so the surface draws in
+   the frame the panel shows; the next flush() sends the full frame. */
 void display_release(zend_object *obj);
 
 /* For a renderer that paces itself on the panel's TE pulses (Slate), since ext-display 1.1: cb(arg) runs in the TE
@@ -122,6 +140,15 @@ void display_release(zend_object *obj);
    an attach with vsync) the hook stops getting pulses; set it again to take the pin back. false when obj is not
    a display or the display has no TE pin. PHP task only. */
 bool display_vsync_hook(zend_object *obj, void (*cb)(void *arg), void *arg);
+
+/* since 1.2: a frame pulse of a panel attached with te_driver: the same as a pulse on a TE pin for the surfaces of
+   that panel that want it (onVsync(), vsync flushes, display_vsync_hook()). Call it from an interrupt only, never
+   from a task: a detach on the PHP task spins until a running pulse ends, so a pulse in a task of lower priority
+   on the same core would never end. It does not block, but it is not IRAM-safe: it runs code in flash (and may
+   touch PSRAM), so the interrupt that calls it must not stay enabled while the flash cache is off (on ESP32: an
+   RGB panel without CONFIG_LCD_RGB_ISR_IRAM_SAFE, an interrupt without ESP_INTR_FLAG_IRAM). The pulses then stop
+   during a flash write (NVS, OTA); with an IRAM-safe interrupt the first such write during a pulse panics. */
+void display_te_pulse(void *panel);
 
 /* The methods of Output\Display, for the driver class's method table (terminated by ZEND_FE_END). */
 extern const zend_function_entry display_methods[];

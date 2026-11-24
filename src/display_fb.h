@@ -37,6 +37,7 @@ typedef struct {
     uint16_t *px;            /* w*h pixels, rows top to bottom */
     int w, h;
     display_fb_rect_t dirty; /* empty when x0 >= x1 */
+    bool native;   /* the pixels in the CPU's byte order (a driver's framebuffer); false: as DISPLAY_FB_PRESWAP says */
 } display_fb_t;
 
 /* A GFX or extended font, seen the same way (display_text.h). */
@@ -56,7 +57,11 @@ static inline uint16_t display_fb_load(uint16_t v)
     return display_fb_store(v);   /* the swap is its own inverse */
 }
 
-void display_fb_init(display_fb_t *fb, uint16_t *px, int w, int h);
+/* A color as this framebuffer stores it, and back: native framebuffers keep the CPU's order (since 1.2). */
+static inline uint16_t display_fb_put(const display_fb_t *fb, uint16_t c) { return fb->native ? c : display_fb_store(c); }
+static inline uint16_t display_fb_got(const display_fb_t *fb, uint16_t v) { return fb->native ? v : display_fb_load(v); }
+
+void display_fb_init(display_fb_t *fb, uint16_t *px, int w, int h);   /* native false */
 uint16_t display_fb_rgb565(int r, int g, int b);
 uint16_t display_fb_get(const display_fb_t *fb, int x, int y);   /* native color; 0 off screen */
 
@@ -76,10 +81,11 @@ void display_fb_mark(display_fb_t *fb, int x0, int y0, int x1, int y1);
 bool display_fb_take_dirty(display_fb_t *fb, display_fb_rect_t *out);
 /* Clips r to the screen; false when nothing is left. */
 bool display_fb_clip(const display_fb_t *fb, display_fb_rect_t *r);
-/* Writes the rows of [x0,x1) x [y0,y1) contiguously in the panel's byte order (2 bytes per pixel). */
+/* Writes the rows of [x0,x1) x [y0,y1) contiguously in the panel's byte order (2 bytes per pixel): copied from a
+   pre-swapped framebuffer, swapped from a native one. */
 void display_fb_emit(const display_fb_t *fb, int x0, int y0, int x1, int y1, uint8_t *out);
-/* The framebuffer rows y0..y1 as they go to the panel, when no copy is needed (full width, pre-swapped);
-   NULL otherwise. */
+/* The framebuffer rows y0..y1 as they go to the panel, when no copy is needed (full width, pre-swapped, not
+   native); NULL otherwise. */
 const uint8_t *display_fb_direct(const display_fb_t *fb, int x0, int y0, int x1);
 
 /* The text helpers of display_text.h under the framebuffer's names. */

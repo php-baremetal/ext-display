@@ -25,6 +25,7 @@ void display_fb_init(display_fb_t *fb, uint16_t *px, int w, int h)
     fb->w = w;
     fb->h = h;
     fb->dirty = (display_fb_rect_t){ 0, 0, 0, 0 };
+    fb->native = false;
 }
 
 uint16_t display_fb_rgb565(int r, int g, int b)
@@ -40,7 +41,7 @@ uint16_t display_fb_get(const display_fb_t *fb, int x, int y)
     if (x < 0 || y < 0 || x >= fb->w || y >= fb->h) {
         return 0;
     }
-    return display_fb_load(fb->px[(size_t)y * fb->w + x]);
+    return display_fb_got(fb, fb->px[(size_t)y * fb->w + x]);
 }
 
 void display_fb_mark(display_fb_t *fb, int x0, int y0, int x1, int y1)
@@ -114,7 +115,7 @@ void display_fb_clear(display_fb_t *fb, uint16_t c)
 void display_fb_pixel(display_fb_t *fb, int x, int y, uint16_t c)
 {
     if (x >= 0 && y >= 0 && x < fb->w && y < fb->h) {
-        fb->px[(size_t)y * fb->w + x] = display_fb_store(c);
+        fb->px[(size_t)y * fb->w + x] = display_fb_put(fb, c);
         display_fb_mark(fb, x, y, x + 1, y + 1);
     }
 }
@@ -128,7 +129,7 @@ void display_fb_fill_rect(display_fb_t *fb, int x, int y, int w, int h, uint16_t
     if (!display_fb_clip(fb, &r)) {
         return;
     }
-    uint16_t s = display_fb_store(c);
+    uint16_t s = display_fb_put(fb, c);
     for (int j = r.y0; j < r.y1; j++) {
         span(fb, r.x0, j, r.x1 - r.x0, s);
     }
@@ -148,7 +149,7 @@ void display_fb_rect(display_fb_t *fb, int x, int y, int w, int h, uint16_t c)
 
 void display_fb_line(display_fb_t *fb, int x0, int y0, int x1, int y1, uint16_t c)
 {
-    uint16_t s = display_fb_store(c);
+    uint16_t s = display_fb_put(fb, c);
     int dx = x1 > x0 ? x1 - x0 : x0 - x1, sx = x0 < x1 ? 1 : -1;
     int dy = y1 > y0 ? y0 - y1 : y1 - y0, sy = y0 < y1 ? 1 : -1;
     int err = dx + dy;
@@ -193,7 +194,7 @@ void display_fb_circle(display_fb_t *fb, int cx, int cy, int r, uint16_t c)
     if (r < 0) {
         return;
     }
-    uint16_t s = display_fb_store(c);
+    uint16_t s = display_fb_put(fb, c);
     CIRCLE_POINTS(r, {
         plot(fb, cx + x, cy + y, s); plot(fb, cx - x, cy + y, s);
         plot(fb, cx + x, cy - y, s); plot(fb, cx - x, cy - y, s);
@@ -208,7 +209,7 @@ void display_fb_fill_circle(display_fb_t *fb, int cx, int cy, int r, uint16_t c)
     if (r < 0) {
         return;
     }
-    uint16_t s = display_fb_store(c);
+    uint16_t s = display_fb_put(fb, c);
     CIRCLE_POINTS(r, {
         span(fb, cx - x, cy + y, 2 * x + 1, s); span(fb, cx - x, cy - y, 2 * x + 1, s);
         span(fb, cx - y, cy + x, 2 * y + 1, s); span(fb, cx - y, cy - x, 2 * y + 1, s);
@@ -230,11 +231,19 @@ void display_fb_image(display_fb_t *fb, int x, int y, int w, int h, const uint8_
     if (!display_fb_clip(fb, &r)) {
         return;
     }
+    /* decided once: pre-swapped storage holds the bytes as they come (high first), so a row is a copy; a native
+       framebuffer (or DISPLAY_FB_PRESWAP=0) holds the CPU's value */
+    bool copy = !fb->native && DISPLAY_FB_PRESWAP;
+    int n = r.x1 - r.x0;
     for (int j = r.y0; j < r.y1; j++) {
         const uint8_t *src = bytes + ((size_t)(j - y) * w + (r.x0 - x)) * 2;
-        uint16_t *dst = fb->px + (size_t)j * fb->w;
-        for (int i = r.x0; i < r.x1; i++, src += 2) {
-            dst[i] = display_fb_store((uint16_t)((src[0] << 8) | src[1]));
+        uint16_t *dst = fb->px + (size_t)j * fb->w + r.x0;
+        if (copy) {
+            memcpy(dst, src, (size_t)n * 2);
+            continue;
+        }
+        for (int i = 0; i < n; i++, src += 2) {
+            dst[i] = (uint16_t)((src[0] << 8) | src[1]);
         }
     }
     display_fb_mark(fb, r.x0, r.y0, r.x1, r.y1);
@@ -242,24 +251,25 @@ void display_fb_image(display_fb_t *fb, int x, int y, int w, int h, const uint8_
 
 void display_fb_emit(const display_fb_t *fb, int x0, int y0, int x1, int y1, uint8_t *out)
 {
+    bool swap = fb->native || !DISPLAY_FB_PRESWAP;
     for (int j = y0; j < y1; j++) {
         const uint16_t *row = fb->px + (size_t)j * fb->w;
-#if DISPLAY_FB_PRESWAP
-        memcpy(out, row + x0, (size_t)(x1 - x0) * 2);
-        out += (size_t)(x1 - x0) * 2;
-#else
+        if (!swap) {
+            memcpy(out, row + x0, (size_t)(x1 - x0) * 2);
+            out += (size_t)(x1 - x0) * 2;
+            continue;
+        }
         for (int i = x0; i < x1; i++) {
             *out++ = (uint8_t)(row[i] >> 8);
             *out++ = (uint8_t)row[i];
         }
-#endif
     }
 }
 
 const uint8_t *display_fb_direct(const display_fb_t *fb, int x0, int y0, int x1)
 {
 #if DISPLAY_FB_PRESWAP
-    if (x0 == 0 && x1 == fb->w) {
+    if (!fb->native && x0 == 0 && x1 == fb->w) {
         return (const uint8_t *)(fb->px + (size_t)y0 * fb->w);
     }
 #else
@@ -280,7 +290,7 @@ static void draw_glyph(display_fb_t *fb, int cx, int base, const display_fb_font
                        uint16_t fg, int bg)
 {
     unsigned bpp = f->bpp, max = (1u << bpp) - 1;
-    uint16_t sfg = display_fb_store(fg);
+    uint16_t sfg = display_fb_put(fb, fg);
     const uint8_t *bits = f->bitmap + g->bitmapOffset;
     int x0 = cx + g->xOffset, y0 = base + g->yOffset;
     size_t bit = 0;
@@ -289,7 +299,7 @@ static void draw_glyph(display_fb_t *fb, int cx, int base, const display_fb_font
             unsigned v = (bits[bit / 8] >> (8 - bpp - bit % 8)) & max;
             if (bg >= 0) {
                 if (v) {   /* v == 0: the cell is already bg; a box that overhangs keeps the neighbour's ink */
-                    plot(fb, x0 + i, y0 + j, display_fb_store(blend(fg, (uint16_t)bg, v, max)));
+                    plot(fb, x0 + i, y0 + j, display_fb_put(fb, blend(fg, (uint16_t)bg, v, max)));
                 }
             } else if (v * 2 > max) {
                 plot(fb, x0 + i, y0 + j, sfg);

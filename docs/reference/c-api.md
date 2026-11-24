@@ -36,14 +36,17 @@ typedef struct {
     /* Asynchronous flush (both NULL for a synchronous panel, which only has push). */
     bool (*begin)(void *panel, const display_job_t *job);
     bool (*wait)(void *panel, uint32_t ms);
-    /* since 1.1, last in the struct */
+    /* since 1.1 */
     const display_band_ops_t *band;   /* NULL: no band path */
+    /* since 1.2, last in the struct */
+    const display_driver_fb_t *fb;    /* NULL: the surface allocates its own framebuffer */
 } display_panel_ops_t;
 
 typedef struct {
     bool buffered;   /* a copy of the framebuffer, which the panel reads */
-    bool vsync;      /* every region starts at the next TE pulse; needs te */
+    bool vsync;      /* every region starts at the next TE pulse; needs te (or te_driver) */
     int te;          /* GPIO of the panel's TE output; -1: no TE pin */
+    bool te_driver;  /* since 1.2: no TE pin, the driver calls display_te_pulse() at every frame; te must be -1 */
 } display_attach_opts_t;
 ```
 <!-- @endcode-block -->
@@ -59,6 +62,7 @@ typedef struct {
   them stays synchronous with `push`.
 - `band` (since 1.1) is the optional [band path](#band-path). Always initialise `display_panel_ops_t` with designated
   initialisers: a field you do not name is `NULL`, so a driver written for 1.0 has no band path.
+- `fb` (since 1.2) is the driver's own framebuffer; see [A driver's framebuffer](#a-drivers-framebuffer).
 - `format` must be `DISPLAY_FORMAT_RGB565`. `caps` is reserved for hardware features; nothing uses
   `DISPLAY_CAP_HW_SCROLL` yet.
 
@@ -66,7 +70,7 @@ typedef struct {
 
 | Declaration | Meaning |
 | --- | --- |
-| `bm_err_t display_attach_ex(zend_object *obj, const display_panel_ops_t *ops, void *panel, const display_attach_opts_t *opts)` | Binds a new surface (framebuffer cleared to 0) to `obj`; attaching again replaces it (the old surface first waits for its flush and lets its TE pin go). With `ops->begin` the flushes are asynchronous and `ops->wait` is required; a synchronous panel ignores `buffered` and `vsync`. `opts` `NULL`: no copy, no vsync, no TE pin. `BM_ERR_NO_MEM` without memory for the framebuffer or the copy, `BM_ERR_INVALID_ARG` for `vsync` without `te` (the driver throws `\ValueError` `<Class>: vsync needs the TE pin (te:)`), `BM_ERR_INVALID_STATE` for a zero size, no `push`, a format other than RGB565, `begin` without `wait`, or a surface that cannot be recorded. `ops` and `panel` must outlive the object. |
+| `bm_err_t display_attach_ex(zend_object *obj, const display_panel_ops_t *ops, void *panel, const display_attach_opts_t *opts)` | Binds a new surface (framebuffer cleared to 0; with `ops->fb`, left as the driver has it) to `obj`; attaching again replaces it (the old surface first waits for its flush and lets its TE pin go). With `ops->begin` the flushes are asynchronous and `ops->wait` is required; a synchronous panel ignores `buffered` and `vsync`. `opts` `NULL`: no copy, no vsync, no TE pin. With `ops->fb` (since 1.2) the surface draws in the driver's framebuffer and allocates none. `BM_ERR_NO_MEM` without memory for the framebuffer or the copy, or with `te_driver` when two other panels already take driver pulses; `BM_ERR_INVALID_ARG` for `vsync` without `te` or `te_driver` (the driver throws `\ValueError` `<Class>: vsync needs the TE pin (te:)`), or `te_driver` with `te` >= 0; `BM_ERR_INVALID_STATE` for a zero size, no `push`, a format other than RGB565, `begin` without `wait`, `fb` with `begin` or without `px`, or a surface that cannot be recorded. `ops` and `panel` must outlive the object. |
 | `bm_err_t display_attach(zend_object *obj, const display_panel_ops_t *ops, void *panel)` | `display_attach_ex(obj, ops, panel, NULL)`. |
 | `void display_quiesce(void *panel)` | Waits until no surface attached with `panel` has a flush in flight or pending (a `vsync` region still waiting for the TE is dropped): call it before the driver frees the panel or stops its task. PHP task only. |
 | `extern const zend_function_entry display_methods[]` | The `Output\Display` methods, terminated by `ZEND_FE_END`, with the interface's arginfo. |
@@ -76,7 +80,8 @@ typedef struct {
 | `void display_panel_of(zend_object *obj, const display_panel_ops_t **ops, void **panel)` | Since 1.1. The ops and the driver's `panel` behind a display object, for a [renderer](#renderers); `*ops` is `NULL` when `obj` is not a display or has no surface. |
 | `bool display_claim(zend_object *obj, const char *owner)` | Since 1.1. Takes the panel for `owner`; see [Renderers](#renderers). PHP task only. |
 | `bool display_claim_ex(zend_object *obj, const char *owner, void (*notify)(void *arg, display_panel_event_t event), void *arg)` | Since 1.1. `display_claim()` with a callback for sleep, wake and a lost picture (`display_panel_event_t`); see [Renderers](#renderers). PHP task only. |
-| `void display_release(zend_object *obj)` | Since 1.1. Gives the panel back: the next `flush()` sends the full frame. |
+| `void display_release(zend_object *obj)` | Since 1.1. Gives the panel back: a double-buffered driver's `show_main()` runs first (since 1.2), then the next `flush()` sends the full frame. |
+| `void display_te_pulse(void *panel)` | Since 1.2. A frame pulse of a panel attached with `te_driver`, from the driver's interrupt only; not IRAM-safe; see [TE from the driver](#te-from-the-driver). |
 | `zend_class_entry *display_ce(void)` | `Baremetal\Output\Display`, for `zend_class_implements()`. |
 | `const char *display_panel_name(zend_object *obj)` | The short class name, for messages. |
 
@@ -193,6 +198,98 @@ void my_panel_register(void)   /* from the driver's MINIT, after ext-display's *
 ```
 <!-- @endcode-block -->
 
+## Drivers outside a bus extension
+
+Since 1.2 a panel that is not a device of a bus extension (an RGB panel on the chip's LCD peripheral, with no SPI
+or I2C bus behind it) registers its class through ext-display's `display_drivers` registry, as an LED driver does
+through ext-led's `led_drivers`. Header `display_driver_desc.h`:
+
+<!-- @code-block language="c" label="display_driver_desc.h" -->
+```c
+typedef struct display_driver_desc {
+    const char *name;                           /* "rgb" */
+    const char *php_class;                      /* "Rgb" */
+    const zend_function_entry *methods;
+    void (*class_init)(zend_class_entry *ce);   /* optional: constants, and create_object with its own handlers
+                                                   (clone_obj NULL: a clone would have no surface) */
+} display_driver_desc_t;
+
+extern const display_driver_desc_t *const display_drivers[];   /* NULL-terminated */
+extern const size_t display_drivers_count;
+```
+<!-- @endcode-block -->
+
+- The driver package defines a `const display_driver_desc_t` and lists it in its `composer.json`:
+  `"extra": { "baremetal": { "register": { "display_drivers": ["rgb_display_driver_desc"] } } }`. The build
+  generates the table from the packages installed; it is empty when there is none.
+- At start-up ext-display registers `Baremetal\Display\Driver\<php_class>`, final, implementing
+  `Baremetal\Output\Display`, with `methods` as its method table: the driver's own methods (its `__construct`)
+  followed by `DISPLAY_FE`, in a static table. `class_init`, when set, runs on the new class: for constants, and
+  also for its object handlers (a `create_object` whose handlers set `clone_obj` to NULL, for example, since a
+  clone would have no surface; without one the class gets the standard handlers).
+- The constructor attaches a surface with `display_attach_ex()` as any other driver does.
+
+## A driver's framebuffer
+
+A panel that scans a framebuffer by itself (an RGB panel refreshed from PSRAM by the LCD peripheral) gives it to
+the surface with `display_panel_ops_t::fb` (since 1.2), so the surface draws there and allocates none:
+
+<!-- @code-block language="c" label="display_panel.h" -->
+```c
+typedef struct {
+    uint16_t *px;   /* width * height pixels, rows top to bottom, RGB565 in the CPU's byte order */
+    /* after flush(): [x0,x1) x [y0,y1) changed; make it visible to the panel (a cache writeback when the panel
+       reads memory without the cache). NULL: nothing to do. PHP task. */
+    void (*sync)(void *panel, int x0, int y0, int x1, int y1);
+} display_driver_fb_t;
+```
+<!-- @endcode-block -->
+
+- The pixels are in the CPU's byte order (little-endian RGB565), whatever `DISPLAY_FB_PRESWAP` says: the surface
+  marks that framebuffer native and writes colors without the swap.
+- The panel is synchronous: `begin` must be `NULL` (`BM_ERR_INVALID_STATE` otherwise), `buffered` is ignored and
+  no band is allocated. `flush()` sends nothing: it calls `sync` on the changed rectangle (or on the region given),
+  and the `onFlushed()` event follows as usual. The drawings show as soon as the panel reads them, before
+  `flush()`.
+- `push` is still required: it stays the way to copy a region (rows high byte first, as for any panel).
+- The framebuffer is the driver's: ext-display never frees it, and it must outlive the object.
+- The coordinates of the surface are the framebuffer's. A driver that mirrors or rotates the picture does not
+  set `fb`; the surface then allocates its own and pushes as for any other panel.
+- The surface keeps the pixels the driver has at attach: they are not cleared, and the first `flush()` syncs
+  nothing until something is drawn.
+- A [renderer](#renderers) that sends bands to the same panel writes the same memory. After `display_release()`
+  the framebuffer holds the renderer's last frame, not what the surface drew before the claim. With a double buffer
+  (`display_band_ops_t::frames` 2) `fb->px` is the main frame: the surface draws there, and `display_release()`
+  shows it again after a renderer.
+
+## TE from the driver
+
+A panel without a TE pin may still know when a frame starts (an RGB panel's vsync interrupt). Since 1.2 the driver
+attaches with `display_attach_opts_t::te_driver` (`te` stays `-1`) and calls `display_te_pulse(panel)` at every
+frame, from its interrupt:
+
+<!-- @code-block language="c" label="display_panel.h" -->
+```c
+void display_te_pulse(void *panel);   /* from an interrupt only; not IRAM-safe */
+```
+<!-- @endcode-block -->
+
+- A pulse is the same as a falling edge on a TE pin for the surfaces of that panel that want it: `onVsync()`,
+  the `vsync` regions of an asynchronous driver and the renderer's `display_vsync_hook()`.
+- `panel` is the pointer given to `display_attach_ex()`. A pulse before the first `onVsync()` (or hook, or `vsync`
+  attach) reaches nobody and costs a short scan of a two-entry table.
+- Several objects of one panel share its pulses as they share a TE pin: the last one to attach receives them, and
+  they pass to another live object of the panel when it goes. Two panels at most take driver pulses at once.
+- When the surface goes, ext-display waits for a pulse that is running before it frees the surface.
+- Call it from an interrupt only, never from a task. The detach on the PHP task spins until a running pulse ends:
+  a pulse in a task of lower priority on the same core would never get the CPU back to end, and the PHP task
+  would spin for ever.
+- It does not block, but it is not IRAM-safe: it runs code in flash (the event raise, the renderer's hook) and
+  may touch PSRAM. The interrupt that calls it must not stay enabled while the flash cache is off. On ESP32 that
+  means an RGB panel without `CONFIG_LCD_RGB_ISR_IRAM_SAFE`, and no `ESP_INTR_FLAG_IRAM` on the interrupt. The
+  pulses then stop while the flash cache is off (an NVS or OTA write): `onVsync()` and the hook miss those frames.
+  With an IRAM-safe interrupt, the first flash write during a pulse is a cache-access panic.
+
 ## Band path
 
 Since 1.1 a driver can offer a second way to put a picture on its panel, for a renderer that composes outside the
@@ -221,6 +318,12 @@ typedef struct {
     bm_err_t (*begin)(void *panel, int x0, int y0, int x1, int y1);
     bm_err_t (*push)(void *panel, int y0, int rows, const void *px, void (*done)(void *arg), void *arg);
     bm_err_t (*end)(void *panel);
+    /* since 1.2, at the end: a driver built for 1.1 (designated initialisers) leaves them 0 / NULL */
+    uint8_t frames;         /* 0 or 1: one frame; 2: a double buffer, the bands go to a hidden frame */
+    bool cpu_order;         /* the bands are RGB565 in the CPU's byte order; false: high byte first */
+    bm_err_t (*present)(void *panel);     /* frames 2 only (NULL otherwise) */
+    bm_err_t (*show_main)(void *panel);   /* frames 2 only (NULL otherwise) */
+    bm_err_t (*carry)(void *panel, int x0, int y0, int x1, int y1, int dx, int dy);   /* optional, frames 2 only */
 } display_band_ops_t;
 ```
 <!-- @endcode-block -->
@@ -234,7 +337,7 @@ A region `[x0, x1) x [y0, y1)` is sent as `begin`, then `push` for each band fro
   never exceeds `bytes_max`; `rows` in the struct is the height the driver advises.
 - **Buffers.** The renderer gets the band buffers from `buf_alloc(panel, bytes)` (`bytes <= bytes_max`; `NULL` without
   memory), so the driver picks DMA-capable internal RAM and its alignment. `px` of `push` is such a buffer, RGB565,
-  high byte first like `ops->push`, with contiguous rows of `x1 - x0` pixels. `buf_free(panel, px)` takes it back, after
+  high byte first like `ops->push` (unless `cpu_order`), with contiguous rows of `x1 - x0` pixels. `buf_free(panel, px)` takes it back, after
   its `done` ran or its `push` failed.
 - **Pipelining.** `push` may be called again before the previous `done`. The driver accepts at least 2 bands in
   flight; when it cannot take one more it blocks inside `push` until it can. `done(arg)` runs exactly once for each
@@ -259,6 +362,34 @@ A region `[x0, x1) x [y0, y1)` is sent as `begin`, then `push` for each band fro
   `DISPLAY_SCAN_UNKNOWN` (0, what a driver that does not name the field gets) means it does not: the renderer
   sends its bands as they come. Set it only for a panel with its own RAM (`own_ram`) whose TE pulse starts the
   refresh. The driver itself still never waits.
+- **`frames` and `present`.** `frames` 2 is a double buffer: the bands always go to a frame the panel does not
+  show, and `present()` (set only then) makes the bands given since the last `present()` a whole frame, shown from
+  the panel's next frame; it returns at once, and a `present()` without bands does nothing. The next `begin()`
+  blocks until the panel shows the frame presented (normally one scan), so the renderer never writes into the frame
+  the panel reads. The hidden frame is one frame behind: the renderer draws again what changed in the frame before
+  too. The renderer does not race the scan (`scan` is only informative). A `begin()` that does not see the switch
+  within the driver's timeout returns `BM_ERR_TIMEOUT` (nothing taken; the bands of that region are refused too); a
+  `present()` that cannot hand the switch to the panel returns `BM_ERR_TIMEOUT` and keeps the frame hidden. Both are
+  transient: the renderer tries again in a later frame (a later `present()` shows the bands kept). `0` or `1`: one
+  frame, as before.
+- **`cpu_order`.** `true`: every band of the driver is RGB565 in the CPU's byte order and the renderer does not
+  swap it; `false` (the default): high byte first.
+- **`show_main`.** With `frames` 2 the surface keeps drawing in the main frame (`display_driver_fb_t::px`).
+  `display_release()` calls `show_main()` on the PHP task, after the renderer stopped: the driver copies the frame
+  shown into the main frame when another one shows, and shows the main frame, before the surface can draw.
+  `display_attach_ex()` refuses `frames` above 2, `frames` 2 without `present` or `show_main`, and either of them
+  with one frame (`BM_ERR_INVALID_STATE`).
+- **`carry`** (since 1.2, optional, `frames` 2 only). The hidden frame lacks what changed in the frame before. With
+  `carry` the renderer does not compose that again: it asks the driver to copy each rectangle `[x0, x1) x [y0, y1)`
+  (band-path coordinates; the driver maps them through its rotation and mirroring) from the frame shown into the
+  hidden frame, and composes only this frame's changes. With an offset `(dx, dy)` the pixels come from
+  `[x0 + dx, x1 + dx) x [y0 + dy, y1 + dy)` of the frame shown (inside the screen): content that moved by whole
+  pixels, such as a scroll, is copied from where it was instead of composed again. A copy is in order with the bands (after the bands pushed
+  before it, before those pushed after; part of the next `present()`), never inside a region, and waits like
+  `begin()` for the frame presented last to show. The destinations of a frame's copies never overlap each other nor
+  its bands. Errors as for `push`: `BM_ERR_INVALID_STATE` is final; any other error means nothing was copied, and
+  the renderer does not present the frame without it (it composes the rectangle, or drops the frame). `NULL`: the renderer composes the changes of the frame
+  before again, as without it. `display_attach_ex()` refuses `carry` with one frame.
 - **Sleep, wake, backlight.** They stay callable while a renderer holds the panel and ext-display does not wait for
   the renderer's bands. A driver with a band path therefore executes `sleep` and `wake` after the bands it already
   accepted, in the order they came. ext-display tells the renderer before `sleep` and after `wake`
@@ -307,7 +438,8 @@ object and keeps the display's drawing methods out of the way:
    `DISPLAY_PANEL_WAKE` after a `wake` that succeeded, and after a `sleep` that failed; `DISPLAY_PANEL_LOST` when the
    driver calls `display_invalidate()`, so a driver that re-initialises the panel on wake gives `LOST`, then `WAKE`.
    Slate redraws the whole screen on `LOST` and starts no new frame between `SLEEP` and `WAKE` (one under way finishes).
-6. `display_release(obj)` gives the panel back. The renderer has changed the picture, so the next `flush()` sends
+6. `display_release(obj)` gives the panel back, once the renderer has stopped sending bands: with a double buffer
+   it calls the driver's `show_main()` first. The renderer has changed the picture, so the next `flush()` sends
    the full frame. A failed push of the display's own flush that was still unreported at the claim is not thrown
    later: its region is sent again by that flush.
 
@@ -332,8 +464,8 @@ bool display_vsync_hook(zend_object *obj, void (*cb)(void *arg), void *arg);
   same pin takes it later (its first `onVsync()`, or an attach with `vsync`), the hook stops getting pulses until
   it is set again. A renderer should not depend on the pulses alone: Slate falls back to its own timer when the
   pulses stop.
-- `false` when `obj` is not a display or the display has no TE pin (`te:`); the renderer then paces itself
-  another way. PHP task only.
+- `false` when `obj` is not a display or the display has no TE pin (`te:`) and no driver pulses (`te_driver`);
+  the renderer then paces itself another way. PHP task only.
 
 ## Fonts
 
@@ -368,4 +500,5 @@ stops the task that sends the bands.
 By default the framebuffer stores pixels already swapped into the panel's byte order (`DISPLAY_FB_PRESWAP=1`),
 so a full-width region goes to `push` straight from the framebuffer, with no copy. Building with
 `-DDISPLAY_FB_PRESWAP=0` keeps them in the CPU's order instead and swaps them while filling each band. The
-pre-swapped order makes a full-screen flush faster (see [Frame rates](errors-and-limits.md#frame-rates)).
+pre-swapped order makes a full-screen flush faster (see [Frame rates](errors-and-limits.md#frame-rates)). A
+driver's own framebuffer (`display_panel_ops_t::fb`, since 1.2) is always in the CPU's order.

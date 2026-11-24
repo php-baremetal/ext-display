@@ -9,7 +9,10 @@ end of every flush and at every pulse of the panel's TE pin. Text uses bitmap fo
 U+0020 to U+00FF).
 
 ext-display is platform-neutral: it uses the events HAL contract of ext-events for its lock and the TE
-interrupt, and panel drivers plug in through the C contract in `display_panel.h`.
+interrupt, and panel drivers plug in through the C contract in `display_panel.h`. Since 1.2 a panel without a bus
+extension (an RGB panel) registers its class `Baremetal\Display\Driver\<Name>` through ext-display's
+`display_drivers` registry, the surface can draw straight into the framebuffer such a panel scans, and the
+driver can give the frame pulses of a panel without a TE pin.
 
 ## Install
 

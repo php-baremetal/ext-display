@@ -27,12 +27,14 @@ short class name of the driver (`St77916`).
 | `\RuntimeException` | `font '<name>' has an unsupported bpp <n>` | `Font::get()`: an extended font whose bits per pixel are not 1, 2 or 4. |
 | `\RuntimeException` | `no default font: set extra.baremetal.fonts.default to true or pass a font` | `text()`, `textWidth()` without `font:` in a firmware built with `fonts.default` set to `false`. |
 | `\LogicException` | `<Panel>: the panel is driven by <owner>; draw in a <owner> Canvas` | a drawing, `flush()` or `flushWait()` on a display whose panel a renderer holds (`display_claim()`, since 1.1). `width()`, `height()`, `rgb()`, `textWidth()`, `backlight()`, `refreshRate()`, `sleep()`, `wake()`, `onFlushed()` and `onVsync()` keep working. |
+| `\Error` | `<Panel>: the drawing surface is off: set extra.baremetal.options.display-surface to true to draw on the panel directly (a renderer such as Slate draws without it)` | since 1.2: a drawing, `image()`, `flush()` or `flushWait()` in a firmware built with the `display-surface` option off. Checked before the claim. |
 | `\ValueError` | `<Class>::image(): Argument #3 ($w) must be between 0 and 65536` (`#4 ($h)` likewise) | `image()` |
 | `\ValueError` | `<Class>::image(): Argument #5 ($pixels) must be N bytes long (w * h * 2), got M` | `image()` |
 | `\ValueError` | `<Class>::backlight(): Argument #1 ($level) must be between 0 and 255` | `backlight()` |
 | `\ArgumentCountError` | `<Class>::flush() takes all four coordinates or none, N given` | `flush()` with one to three coordinates. |
 | `\ValueError` | `<Class>: vsync needs the TE pin (te:)` | the driver's constructor with `vsync` and no TE pin (for example `Baremetal\Spi\Driver\St77916: vsync needs the TE pin (te:)`). |
-| `\ValueError` | `<Panel>::onVsync(): the display has no TE pin` | `onVsync()` on a display built without a TE pin. |
+| `\ValueError` | `<Panel>::onVsync(): the display has no TE pin` | `onVsync()` on a display built without a TE pin (and, since 1.2, without frame pulses from its driver). |
+| `\RuntimeException` | `<Panel>::onVsync(): too many panels with driver frame pulses` | since 1.2: `onVsync()` on a third panel whose driver gives the frame pulses (an RGB panel), while two others already take them. |
 | `\Error` | `<Panel>::onFlushed(): unknown class '<name>' or too many sources` (`onVsync()` likewise) | `onFlushed()`, `onVsync()`: the class does not exist or the event source table is full, as for the other event sources. |
 | `\Error` | `<Panel> is not initialised` | any method of an object without a surface: its driver did not attach one, or the object is a `clone`. |
 | `\Error` | `Call to private Baremetal\Display\Font::__construct() ...` | `new Font()`: use `Font::get()`. |

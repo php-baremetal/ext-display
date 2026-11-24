@@ -75,7 +75,7 @@ static bool surface_check(display_surface_t *s)
 /* THIS_SURFACE for the methods that draw or send: refused while a renderer holds the panel. */
 #define THIS_DRAW(s)                                             \
     display_surface_t *s = display_surface(Z_OBJ_P(ZEND_THIS)); \
-    if (!s || !display_not_claimed(s) || !surface_check(s)) {    \
+    if (!s || !display_surface_on(s) || !display_not_claimed(s) || !surface_check(s)) { \
         RETURN_THROWS();                                         \
     }
 
@@ -109,9 +109,16 @@ static bool guard(display_surface_t *s, int x0, int y0, int x1, int y1)
         RETURN_THROWS();                         \
     }
 
-/* Pushes r (clipped) to the panel in bands of whole rows. */
+/* Pushes r (clipped) to the panel in bands of whole rows; on the driver's framebuffer (own_fb) the pixels are
+   there already, the driver only makes the rectangle visible. */
 static bool push_region(display_surface_t *s, display_fb_rect_t r)
 {
+    if (s->own_fb) {
+        if (s->ops->fb->sync) {
+            s->ops->fb->sync(s->panel, r.x0, r.y0, r.x1, r.y1);
+        }
+        return true;
+    }
     int rw = r.x1 - r.x0;
     const uint8_t *direct = display_fb_direct(&s->fb, r.x0, r.y0, r.x1);
     if (direct) {

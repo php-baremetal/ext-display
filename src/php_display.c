@@ -12,7 +12,8 @@
 */
 
 /*
- * display extension module: at MINIT it registers Baremetal\Output\Display and Baremetal\Display\Font.
+ * display extension module: at MINIT it registers Baremetal\Output\Display, the classes of the display_drivers
+ * registry (Baremetal\Display\Driver\*) and Baremetal\Display\Font.
  * The surfaces of the driver objects live in a table keyed by object (a weak reference: the surface is
  * freed with its object, and whatever is left at MSHUTDOWN, after its flush in flight ends).
  */
@@ -26,6 +27,7 @@
 #include "zend_weakrefs.h"
 #include "ext/spl/spl_exceptions.h"
 #include "event_bus_php.h"
+#include "display_driver_desc.h"
 
 static HashTable s_surfaces;
 static bool s_replacing;   /* display_attach_ex() is freeing the old surface of a live object */
@@ -136,7 +138,9 @@ static void surface_free(zval *zv)
            the object itself is being freed (or at shutdown) there is nothing left to give back. */
         bm_events_release_later(s->obj);
     }
-    free(s->fb.px);
+    if (!s->own_fb) {
+        free(s->fb.px);   /* the driver's framebuffer stays the driver's */
+    }
     free(s->copy);
     free(s->band);
     lock_put(s->flush.lock);   /* nothing uses it any more: the TE handler and the driver's job are gone */
@@ -181,15 +185,25 @@ bm_err_t display_attach_ex(zend_object *obj, const display_panel_ops_t *ops, voi
                            const display_attach_opts_t *opts)
 {
     if (!obj || !ops || !ops->push || ops->width == 0 || ops->height == 0 || ops->format != DISPLAY_FORMAT_RGB565 ||
-        (ops->begin && !ops->wait)) {
+        (ops->begin && !ops->wait) || (ops->fb && (ops->begin || !ops->fb->px))) {
         return BM_ERR_INVALID_STATE;
     }
+    const display_band_ops_t *bo = ops->band;
+    if (bo && (bo->frames > 2 || (bo->frames == 2) != (bo->present != NULL) ||
+               (bo->frames == 2) != (bo->show_main != NULL) || (bo->carry && bo->frames != 2))) {
+        return BM_ERR_INVALID_STATE;   /* a double buffer needs present and show_main, one frame none (nor carry) */
+    }
     display_attach_opts_t o = opts ? *opts : (display_attach_opts_t){ .buffered = false, .vsync = false, .te = -1 };
-    if (o.vsync && o.te < 0) {
+    if ((o.vsync && o.te < 0 && !o.te_driver) || (o.te_driver && o.te >= 0)) {
         return BM_ERR_INVALID_ARG;
     }
+    if (o.te_driver && !display_te_drv_room(panel)) {
+        return BM_ERR_NO_MEM;   /* no place left for another driver-signalled panel */
+    }
+    bool own_fb = ops->fb != NULL;   /* the driver's framebuffer: drawn in place, nothing to allocate */
+    bool on = DISPLAY_SURFACE_ON;   /* off: no drawing surface, only what a renderer's claim needs */
     bool async = ops->begin != NULL;
-    bool buffered = async && o.buffered;   /* a synchronous panel pushes inside flush(): nothing to copy for */
+    bool buffered = on && async && o.buffered;   /* a synchronous panel pushes inside flush(): nothing to copy for */
     size_t pixels = (size_t)ops->width * ops->height;
     size_t band_px = DISPLAY_BAND_BYTES / 2 < pixels ? DISPLAY_BAND_BYTES / 2 : pixels;
     if (band_px < ops->width) {
@@ -197,14 +211,16 @@ bm_err_t display_attach_ex(zend_object *obj, const display_panel_ops_t *ops, voi
     }
     /* malloc, not emalloc: the framebuffer and its copy stay out of memory_limit and outlive the request's heap */
     display_surface_t *s = calloc(1, sizeof *s);
-    uint16_t *px = calloc(pixels, sizeof(uint16_t));
+    uint16_t *px = own_fb ? ops->fb->px : on ? calloc(pixels, sizeof(uint16_t)) : NULL;
     uint16_t *copy = buffered ? calloc(pixels, sizeof(uint16_t)) : NULL;
-    uint8_t *band = malloc(band_px * 2);
-    bool locked = async || o.te >= 0;   /* the engine, or the TE interrupt of onVsync() */
+    uint8_t *band = own_fb || !on ? NULL : malloc(band_px * 2);   /* flush() only syncs: no band to gather in */
+    bool locked = async || o.te >= 0 || o.te_driver;   /* the engine, or the TE interrupt of onVsync() */
     bm_hal_lock_t *lock = locked ? lock_get() : NULL;
-    if (!s || !px || !band || (buffered && !copy) || (locked && !lock)) {
+    if (!s || (on && !px) || (on && !own_fb && !band) || (buffered && !copy) || (locked && !lock)) {
         free(s);
-        free(px);
+        if (!own_fb) {
+            free(px);
+        }
         free(copy);
         free(band);
         lock_put(lock);
@@ -218,8 +234,12 @@ bm_err_t display_attach_ex(zend_object *obj, const display_panel_ops_t *ops, voi
     s->async = async;
     s->buffered = buffered;
     s->copy = copy;
+    s->own_fb = own_fb;
+    s->off = !on;
     s->te = o.te;
+    s->te_drv = o.te_driver;
     display_fb_init(&s->fb, px, ops->width, ops->height);
+    s->fb.native = own_fb;   /* the driver's pixels are in the CPU's byte order */
     s->flush.lock = lock;
     s->flush.panel = panel;
     s->flush.begin = ops->begin;
@@ -232,7 +252,9 @@ bm_err_t display_attach_ex(zend_object *obj, const display_panel_ops_t *ops, voi
     zend_weakrefs_hash_del(&s_surfaces, obj);   /* the old surface detaches its TE pin before this one takes it */
     s_replacing = false;
     if (!zend_weakrefs_hash_add_ptr(&s_surfaces, obj, s)) {
-        free(px);
+        if (!own_fb) {
+            free(px);
+        }
         free(copy);
         free(band);
         lock_put(lock);
@@ -338,8 +360,22 @@ void display_release(zend_object *obj)
         s->owner[0] = '\0';
         s->notify = NULL;
         s->notify_arg = NULL;
+        const display_band_ops_t *b = s->ops->band;
+        if (b && b->show_main) {
+            b->show_main(s->panel);   /* a double buffer shows its main frame again: the one the surface draws in */
+        }
         display_fb_mark(&s->fb, 0, 0, s->fb.w, s->fb.h);   /* the renderer changed the picture: send it all */
     }
+}
+
+bool display_surface_on(const display_surface_t *s)
+{
+    if (!s->off) {
+        return true;
+    }
+    zend_throw_error(NULL, "%s: the drawing surface is off: set extra.baremetal.options.display-surface to true "
+        "to draw on the panel directly (a renderer such as Slate draws without it)", display_panel_name(s->obj));
+    return false;
 }
 
 bool display_not_claimed(const display_surface_t *s)
@@ -352,10 +388,31 @@ bool display_not_claimed(const display_surface_t *s)
     return false;
 }
 
+void display_driver_classes_register(void)
+{
+    for (size_t i = 0; i < display_drivers_count; i++) {
+        const display_driver_desc_t *d = display_drivers[i];
+        if (!d || !d->php_class) {
+            continue;
+        }
+        zend_string *fqn = zend_strpprintf(0, "Baremetal\\Display\\Driver\\%s", d->php_class);
+        zend_class_entry ce;
+        INIT_CLASS_ENTRY_EX(ce, ZSTR_VAL(fqn), ZSTR_LEN(fqn), d->methods);
+        zend_class_entry *dce = zend_register_internal_class(&ce);
+        zend_string_release(fqn);
+        dce->ce_flags |= ZEND_ACC_FINAL;
+        zend_class_implements(dce, 1, display_ce());
+        if (d->class_init) {
+            d->class_init(dce);
+        }
+    }
+}
+
 PHP_MINIT_FUNCTION(display)
 {
     display_surfaces_startup();
     display_interface_register();
+    display_driver_classes_register();
     display_events_register();
     display_font_class_register();
     return SUCCESS;
@@ -381,6 +438,6 @@ zend_module_entry display_module_entry = {
     NULL,   /* RINIT */
     NULL,   /* RSHUTDOWN */
     NULL,   /* MINFO */
-    "1.1.0",
+    "1.2.0",
     STANDARD_MODULE_PROPERTIES
 };
